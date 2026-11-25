@@ -17,16 +17,17 @@ Building requires Windows x64 and [w64devkit](https://github.com/skeeto/w64devki
 
 ```text
 make
-make package VERSION=0.1.0
+make package VERSION=0.1.2
 ```
 
 To build the Windows installer, also install [Inno Setup 6](https://jrsoftware.org/isinfo.php), then run:
 
 ```text
-make installer VERSION=0.1.0
+make installer VERSION=0.1.2
 ```
 
 Release files are created under `build\`. End users do not need w64devkit or Inno Setup.
+The `VERSION` value also determines the version shown in the Settings window.
 
 ## License
 

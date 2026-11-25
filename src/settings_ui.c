@@ -7,6 +7,13 @@
 #include <wctype.h>
 #include "settings_ui.h"
 
+#ifndef ASCIIWALL_VERSION
+#define ASCIIWALL_VERSION "dev"
+#endif
+
+#define WIDEN_LITERAL_INNER(value) L##value
+#define WIDEN_LITERAL(value) WIDEN_LITERAL_INNER(value)
+
 #define CLS_SETTINGS L"AsciiWall.Settings"
 #define IDI_APP_ICON 1
 #define ID_TAB 100
@@ -79,6 +86,7 @@ static HFONT s_font, s_value_font, s_header_font, s_subtitle_font;
 static HBRUSH s_background_brush, s_header_brush, s_accent_brush;
 static HICON s_app_icon;
 static const COLORREF s_background_color = RGB(246, 248, 252);
+static const WCHAR s_title[] = L"Winter Campfire v" WIDEN_LITERAL(ASCIIWALL_VERSION);
 
 static int px(int v) { return MulDiv(v, s_scale, 100); }
 
@@ -237,8 +245,6 @@ static void apply_defaults(void) {
     for (int i = 0; i < ARRAYSIZE(s_controls); i++)
         if (s_controls[i].page != PAGE_SCREEN)
             set_control_value(&s_controls[i], s_controls[i].def);
-    SendMessageW(s_wallpaper_enabled, BM_SETCHECK, BST_CHECKED, 0);
-    SendMessageW(s_run_at_startup, BM_SETCHECK, BST_UNCHECKED, 0);
     SendMessageW(s_tree_lights, BM_SETCHECK, BST_CHECKED, 0);
     update_tree_dependencies();
 }
@@ -397,7 +403,7 @@ static LRESULT CALLBACK settings_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(255, 255, 255));
         if (s_header_font) SelectObject(dc, s_header_font);
-        TextOutW(dc, px(76), px(13), L"Winter Campfire", 15);
+        TextOutW(dc, px(76), px(13), s_title, ARRAYSIZE(s_title) - 1);
         SetTextColor(dc, RGB(199, 218, 237));
         if (s_subtitle_font) SelectObject(dc, s_subtitle_font);
         TextOutW(dc, px(76), px(37), L"Personalize your ASCII wallpaper", 32);

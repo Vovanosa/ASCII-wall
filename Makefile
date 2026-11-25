@@ -1,14 +1,16 @@
 .RECIPEPREFIX := >
 CC      := gcc
-CFLAGS  := -O2 -Wall -DNDEBUG -Ilua
+VERSION ?= 0.1.2
+CFLAGS  := -O2 -Wall -DNDEBUG -Ilua -DASCIIWALL_VERSION=\"$(VERSION)\"
 LDFLAGS := -s -static -mwindows -municode
 LIBS    := -luser32 -lgdi32 -ladvapi32 -lwtsapi32 -ldwmapi -lshell32 -lcomctl32
 LUA     := $(filter-out lua/lua.c lua/luac.c lua/onelua.c,$(wildcard lua/*.c))
-VERSION ?= 0.1.0
 
-.PHONY: run stop clean package installer
+.PHONY: run stop clean package installer FORCE
 
-dist/asciiwall.exe: src/main.c src/settings_ui.c src/settings_ui.h build/app.res.o $(LUA)
+FORCE:
+
+dist/asciiwall.exe: FORCE src/main.c src/settings_ui.c src/settings_ui.h build/app.res.o $(LUA)
 > @mkdir -p dist
 > $(CC) $(CFLAGS) src/main.c src/settings_ui.c build/app.res.o $(LUA) -o $@ $(LDFLAGS) $(LIBS)
 
