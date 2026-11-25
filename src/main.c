@@ -128,8 +128,13 @@ static void set_err(const char *m) { lstrcpynA(g.err, m ? m : "unknown error", s
 /* Запуск/пауза. Пауза = таймер скасовано, потік спить у MsgWait без пробуджень. */
 static void set_running(BOOL force) {
     BOOL visible = g.wall && g.enabled;
-    if (g.wall && IsWindowVisible(g.wall) != visible)
+    if (g.wall && IsWindowVisible(g.wall) != visible) {
+        HWND parent = visible ? NULL : GetParent(g.wall);
         ShowWindow(g.wall, visible ? SW_SHOWNA : SW_HIDE);
+        if (parent)
+            RedrawWindow(parent, NULL, NULL,
+                         RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    }
     BOOL run = visible && !g.locked && !g.display_off && !g.covered;
     if (run == g.running && !force) return;
     g.running = run;
