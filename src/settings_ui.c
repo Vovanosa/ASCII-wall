@@ -1,0 +1,543 @@
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <commctrl.h>
+#include <math.h>
+#include <stdlib.h>
+#include <wchar.h>
+#include <wctype.h>
+#include "settings_ui.h"
+
+#define CLS_SETTINGS L"AsciiWall.Settings"
+#define IDI_APP_ICON 1
+#define ID_TAB 100
+#define ID_SAVE 101
+#define ID_RANDOMIZE 102
+#define ID_DEFAULTS 103
+#define ID_CLOSE 104
+#define ID_TREE_LIGHTS 105
+#define ID_FPS_DEFAULTS 106
+#define ID_WALLPAPER_ENABLED 107
+#define ID_RUN_AT_STARTUP 108
+#define ID_TRACK_BASE 200
+#define ID_VALUE_BASE 300
+#define SETTINGS_WIDTH 760
+#define SETTINGS_HEIGHT 510
+
+enum { PAGE_SCREEN, PAGE_WEATHER, PAGE_FIRE, PAGE_TREES, PAGE_GROUND, PAGE_COUNT };
+
+typedef struct {
+    const WCHAR *key, *label, *section;
+    int page, decimals;
+    double min, max, step, def;
+    HWND label_hwnd, track, value_hwnd;
+} SettingControl;
+
+static SettingControl s_controls[] = {
+    {L"fps", L"Plugged-in FPS", L"engine", PAGE_SCREEN, 0, 1, 60, 1, 15},
+    {L"fps_battery", L"Battery FPS", L"engine", PAGE_SCREEN, 0, 1, 60, 1, 8},
+    {L"stars_density", L"Star amount", L"scene", PAGE_WEATHER, 1, 0, 5, 0.1, 1},
+    {L"stars_speed", L"Star twinkle speed", L"scene", PAGE_WEATHER, 1, 0, 10, 0.1, 1},
+    {L"stars_variety", L"Star color variety", L"scene", PAGE_WEATHER, 2, 0, 1, 0.01, 1},
+    {L"snow_density", L"Snow amount", L"scene", PAGE_WEATHER, 1, 0, 5, 0.1, 1},
+    {L"snow_speed", L"Snow fall speed", L"scene", PAGE_WEATHER, 1, 0, 10, 0.1, 1},
+    {L"snow_drift", L"Snow sway", L"scene", PAGE_WEATHER, 1, 0, 5, 0.1, 1},
+    {L"wind", L"Wind (left - / right +)", L"scene", PAGE_FIRE, 1, -20, 20, 0.1, 0},
+    {L"fire_power", L"Fire power", L"scene", PAGE_FIRE, 1, 0, 3, 0.1, 1},
+    {L"fire_speed", L"Fire speed", L"scene", PAGE_FIRE, 1, 0, 5, 0.1, 1},
+    {L"fire_width", L"Fire width", L"scene", PAGE_FIRE, 2, 0.25, 3, 0.05, 1},
+    {L"tree_count", L"Number of trees", L"scene", PAGE_TREES, 0, 0, 20, 1, 10},
+    {L"tree_jitter", L"Tree position variation", L"scene", PAGE_TREES, 2, 0, 0.45, 0.01, 0.25},
+    {L"tree_min_scale", L"Smallest tree size", L"scene", PAGE_TREES, 2, 0.35, 3, 0.05, 0.75},
+    {L"tree_max_scale", L"Largest tree size", L"scene", PAGE_TREES, 2, 0.35, 4, 0.05, 1.9},
+    {L"tree_light_count", L"Trees with lights", L"scene", PAGE_TREES, 0, 0, 20, 1, 4},
+    {L"tree_light_interval", L"Light blink interval (seconds)", L"scene", PAGE_TREES, 2, 0.25, 30, 0.25, 1.5},
+    {L"coal_rate", L"Coal emission chance", L"scene", PAGE_GROUND, 2, 0, 1, 0.01, 0.35},
+    {L"glow_power", L"Snow glow", L"scene", PAGE_GROUND, 1, 0, 3, 0.1, 1}
+};
+
+static const WCHAR *s_pages[PAGE_COUNT] = {
+    L"Screen", L"Weather", L"Fire", L"Trees and Lights", L"Ground and Effects"
+};
+static const WCHAR *s_page_hints[PAGE_COUNT] = {
+    L"Set the frame rate for plugged-in and battery operation.",
+    L"Adjust stars and snow. Typed values are clamped to their allowed range.",
+    L"Adjust flame and wind. Type values or drag sliders; out-of-range values are clamped.",
+    L"Set tree spacing and size. Turn on lights to edit their settings.",
+    L"Control embers and snow glow. Type values or drag sliders; values are clamped."
+};
+static HWND s_window, s_tab, s_tree_lights, s_fps_defaults;
+static HWND s_wallpaper_enabled, s_run_at_startup, s_hint;
+static HINSTANCE s_instance;
+static const WCHAR *s_ini;
+static SettingsReloadFn s_reload;
+static SettingsStartupFn s_set_startup;
+static BOOL s_startup_enabled;
+static int s_scale = 100;
+static int s_current_page;
+static BOOL s_build_failed;
+static HFONT s_font, s_value_font, s_header_font, s_subtitle_font;
+static HBRUSH s_background_brush, s_header_brush, s_accent_brush;
+static HICON s_app_icon;
+static const COLORREF s_background_color = RGB(246, 248, 252);
+
+static int px(int v) { return MulDiv(v, s_scale, 100); }
+
+static double clamp_value(double v, double lo, double hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static int control_steps(const SettingControl *c) {
+    return (int)floor((c->max - c->min) / c->step + 0.5);
+}
+
+static double snap_value(const SettingControl *c, double v) {
+    double n = floor((clamp_value(v, c->min, c->max) - c->min) / c->step + 0.5);
+    return c->min + n * c->step;
+}
+
+static void format_value(const SettingControl *c, double value, WCHAR *out, size_t count) {
+    swprintf(out, count, c->decimals == 0 ? L"%.0f" :
+             (c->decimals == 1 ? L"%.1f" : L"%.2f"), value);
+}
+
+static double read_setting(const SettingControl *c) {
+    WCHAR text[64], *end = NULL;
+    GetPrivateProfileStringW(c->section, c->key, L"", text, ARRAYSIZE(text), s_ini);
+    if (!text[0]) return c->def;
+    double v = wcstod(text, &end);
+    return end && *end == 0 && isfinite(v) ? snap_value(c, v) : c->def;
+}
+
+static double control_value(const SettingControl *c) {
+    int pos = (int)SendMessageW(c->track, TBM_GETPOS, 0, 0);
+    return c->min + pos * c->step;
+}
+
+static void update_tree_dependencies(void);
+
+static void set_control_value(SettingControl *c, double value) {
+    value = snap_value(c, value);
+    int pos = (int)floor((value - c->min) / c->step + 0.5);
+    SendMessageW(c->track, TBM_SETPOS, TRUE, pos);
+    WCHAR text[32];
+    format_value(c, value, text, ARRAYSIZE(text));
+    SetWindowTextW(c->value_hwnd, text);
+}
+
+static void show_page_hint(const WCHAR *text) {
+    if (s_hint) SetWindowTextW(s_hint, text);
+}
+
+static void commit_value_edit(int index) {
+    SettingControl *c = &s_controls[index];
+    WCHAR text[64], *end = NULL;
+    GetWindowTextW(c->value_hwnd, text, ARRAYSIZE(text));
+    double value = wcstod(text, &end);
+    BOOL parsed = end && end != text;
+    while (end && iswspace(*end)) end++;
+    if (!parsed || *end != 0 || !isfinite(value)) {
+        set_control_value(c, control_value(c));
+        show_page_hint(L"Enter a valid number; the previous value was kept.");
+        return;
+    }
+
+    set_control_value(c, clamp_value(value, c->min, c->max));
+    if (!wcscmp(c->key, L"tree_count") || !wcscmp(c->key, L"tree_light_count"))
+        update_tree_dependencies();
+    show_page_hint(s_page_hints[s_current_page]);
+}
+
+static LRESULT CALLBACK value_edit_proc(HWND edit, UINT message, WPARAM w, LPARAM l,
+                                        UINT_PTR subclass_id, DWORD_PTR ref_data) {
+    if (message == WM_KEYDOWN && w == VK_RETURN) {
+        commit_value_edit((int)ref_data);
+        return 0;
+    }
+    return DefSubclassProc(edit, message, w, l);
+}
+
+static int find_control(const WCHAR *key) {
+    for (int i = 0; i < ARRAYSIZE(s_controls); i++)
+        if (!wcscmp(s_controls[i].key, key)) return i;
+    return -1;
+}
+
+static void update_tree_dependencies(void) {
+    int count_index = find_control(L"tree_count");
+    int lights_index = find_control(L"tree_light_count");
+    double count = control_value(&s_controls[count_index]);
+    double lights = control_value(&s_controls[lights_index]);
+    if (lights > count) set_control_value(&s_controls[lights_index], count);
+    BOOL enabled = SendMessageW(s_tree_lights, BM_GETCHECK, 0, 0) == BST_CHECKED && count > 0;
+    for (int i = 0; i < ARRAYSIZE(s_controls); i++) {
+        if (!wcscmp(s_controls[i].key, L"tree_light_count") ||
+            !wcscmp(s_controls[i].key, L"tree_light_interval")) {
+            EnableWindow(s_controls[i].track, enabled);
+            EnableWindow(s_controls[i].label_hwnd, enabled);
+            EnableWindow(s_controls[i].value_hwnd, enabled);
+        }
+    }
+}
+
+static void show_page(int page) {
+    s_current_page = page;
+    for (int i = 0; i < ARRAYSIZE(s_controls); i++) {
+        int cmd = s_controls[i].page == page ? SW_SHOW : SW_HIDE;
+        ShowWindow(s_controls[i].label_hwnd, cmd);
+        ShowWindow(s_controls[i].track, cmd);
+        ShowWindow(s_controls[i].value_hwnd, cmd);
+    }
+    ShowWindow(s_tree_lights, page == PAGE_TREES ? SW_SHOW : SW_HIDE);
+    ShowWindow(s_fps_defaults, page == PAGE_SCREEN ? SW_SHOW : SW_HIDE);
+    ShowWindow(s_wallpaper_enabled, page == PAGE_SCREEN ? SW_SHOW : SW_HIDE);
+    ShowWindow(s_run_at_startup, page == PAGE_SCREEN ? SW_SHOW : SW_HIDE);
+    SetWindowTextW(s_hint, s_page_hints[page]);
+    update_tree_dependencies();
+}
+
+static BOOL write_value(const WCHAR *section, const WCHAR *key, const WCHAR *value) {
+    if (WritePrivateProfileStringW(section, key, value, s_ini)) return TRUE;
+    WCHAR message[256];
+    swprintf(message, ARRAYSIZE(message), L"Could not save setting \"%ls\" to settings.ini.", key);
+    MessageBoxW(s_window, message, L"AsciiWall settings", MB_OK | MB_ICONERROR);
+    return FALSE;
+}
+
+static void save_settings(void) {
+    int count_index = find_control(L"tree_count");
+    int lights_index = find_control(L"tree_light_count");
+    double tree_count = control_value(&s_controls[count_index]);
+    double lights = min((int)control_value(&s_controls[lights_index]), (int)tree_count);
+    set_control_value(&s_controls[lights_index], lights);
+
+    for (int i = 0; i < ARRAYSIZE(s_controls); i++) {
+        SettingControl *c = &s_controls[i];
+        double value = i == lights_index ? lights : control_value(c);
+        WCHAR text[32];
+        format_value(c, value, text, ARRAYSIZE(text));
+        if (!write_value(c->section, c->key, text)) return;
+    }
+    if (!write_value(L"scene", L"tree_lights",
+                     SendMessageW(s_tree_lights, BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0"))
+        return;
+    if (!write_value(L"engine", L"enabled",
+                     SendMessageW(s_wallpaper_enabled, BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0"))
+        return;
+    /* A profile-cache flush returns zero even when it succeeds. */
+    WritePrivateProfileStringW(NULL, NULL, NULL, s_ini);
+    BOOL startup_saved = s_set_startup &&
+        s_set_startup(SendMessageW(s_run_at_startup, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    if (s_reload) s_reload();
+    if (!startup_saved)
+        MessageBoxW(s_window, L"Settings were saved, but the Windows startup option could not be updated.",
+                    L"AsciiWall settings", MB_OK | MB_ICONERROR);
+}
+
+static void apply_defaults(void) {
+    for (int i = 0; i < ARRAYSIZE(s_controls); i++)
+        if (s_controls[i].page != PAGE_SCREEN)
+            set_control_value(&s_controls[i], s_controls[i].def);
+    SendMessageW(s_wallpaper_enabled, BM_SETCHECK, BST_CHECKED, 0);
+    SendMessageW(s_run_at_startup, BM_SETCHECK, BST_UNCHECKED, 0);
+    SendMessageW(s_tree_lights, BM_SETCHECK, BST_CHECKED, 0);
+    update_tree_dependencies();
+}
+
+static void apply_fps_defaults(void) {
+    for (int i = 0; i < ARRAYSIZE(s_controls); i++)
+        if (s_controls[i].page == PAGE_SCREEN)
+            set_control_value(&s_controls[i], s_controls[i].def);
+}
+
+static int random_int(int lo, int hi) {
+    return lo + rand() % (hi - lo + 1);
+}
+
+static void randomize_settings(void) {
+    static const struct { const WCHAR *key; double lo, hi; } ranges[] = {
+        {L"stars_density", 0.3, 2.2}, {L"stars_speed", 0.5, 2.5},
+        {L"stars_variety", 0.35, 1}, {L"snow_density", 0.3, 2.0},
+        {L"snow_speed", 0.5, 2.5}, {L"snow_drift", 0.4, 1.8},
+        {L"wind", -8, 8}, {L"fire_power", 0.6, 2.4},
+        {L"fire_speed", 0.5, 3.0}, {L"fire_width", 0.6, 2.2},
+        {L"tree_count", 4, 14}, {L"tree_jitter", 0.08, 0.4},
+        {L"tree_min_scale", 0.5, 1.1}, {L"tree_max_scale", 1.3, 2.8},
+        {L"tree_light_interval", 0.75, 4},
+        {L"coal_rate", 0.1, 0.8}, {L"glow_power", 0.4, 1.8}
+    };
+    for (int i = 0; i < ARRAYSIZE(ranges); i++) {
+        int index = find_control(ranges[i].key);
+        double v = ranges[i].lo + (double)rand() / RAND_MAX * (ranges[i].hi - ranges[i].lo);
+        set_control_value(&s_controls[index], v);
+    }
+    int tree_count_index = find_control(L"tree_count");
+    int lights_index = find_control(L"tree_light_count");
+    int tree_count = (int)control_value(&s_controls[tree_count_index]);
+    set_control_value(&s_controls[lights_index], random_int(0, min(tree_count, 10)));
+    SendMessageW(s_tree_lights, BM_SETCHECK, rand() % 5 == 0 ? BST_UNCHECKED : BST_CHECKED, 0);
+    update_tree_dependencies();
+}
+
+static BOOL create_child(HWND parent, HWND *out, DWORD exstyle, const WCHAR *klass,
+                         const WCHAR *text, DWORD style, int x, int y, int w, int h, int id) {
+    *out = CreateWindowExW(exstyle, klass, text, style, px(x), px(y), px(w), px(h),
+                           parent, (HMENU)(INT_PTR)id, s_instance, NULL);
+    if (*out && s_font) SendMessageW(*out, WM_SETFONT, (WPARAM)s_font, TRUE);
+    return *out != NULL;
+}
+
+static BOOL build_controls(HWND h) {
+    s_tab = CreateWindowExW(0, WC_TABCONTROLW, L"",
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP,
+        px(12), px(78), px(736), px(44), h, (HMENU)(INT_PTR)ID_TAB, s_instance, NULL);
+    if (!s_tab) return FALSE;
+    if (s_font) SendMessageW(s_tab, WM_SETFONT, (WPARAM)s_font, TRUE);
+    TabCtrl_SetPadding(s_tab, px(12), 0);
+    for (int i = 0; i < PAGE_COUNT; i++) {
+        TCITEMW item = { 0 };
+        item.mask = TCIF_TEXT;
+        item.pszText = (WCHAR *)s_pages[i];
+        if (TabCtrl_InsertItem(s_tab, i, &item) == -1) return FALSE;
+    }
+
+    if (!create_child(h, &s_hint, 0, L"STATIC", s_page_hints[PAGE_SCREEN],
+        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE, 24, 134, 712, 36, 0))
+        return FALSE;
+
+    for (int i = 0; i < ARRAYSIZE(s_controls); i++) {
+        SettingControl *c = &s_controls[i];
+        int row = 0;
+        for (int j = 0; j < i; j++) if (s_controls[j].page == c->page) row++;
+        int y = 180 + row * 34 + (c->page == PAGE_TREES ? 34 : 0);
+        int id = ID_TRACK_BASE + i;
+        WCHAR initial[32];
+        format_value(c, read_setting(c), initial, ARRAYSIZE(initial));
+        if (!create_child(h, &c->label_hwnd, 0, L"STATIC", c->label,
+                          WS_CHILD | SS_LEFT | SS_CENTERIMAGE, 24, y + 3, 236, 28, 0) ||
+            !create_child(h, &c->track, 0, TRACKBAR_CLASSW, L"",
+                          WS_CHILD | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
+                          280, y, 280, 30, id) ||
+            !create_child(h, &c->value_hwnd, 0, L"EDIT", initial,
+                          WS_CHILD | WS_TABSTOP | WS_BORDER | ES_CENTER | ES_AUTOHSCROLL,
+                          580, y + 3, 84, 26, ID_VALUE_BASE + i))
+            return FALSE;
+        if (s_value_font)
+            SendMessageW(c->value_hwnd, WM_SETFONT, (WPARAM)s_value_font, TRUE);
+        if (!SetWindowSubclass(c->value_hwnd, value_edit_proc, 1, (DWORD_PTR)i))
+            return FALSE;
+        int steps = control_steps(c);
+        SendMessageW(c->track, TBM_SETRANGE, TRUE, MAKELONG(0, steps));
+        SendMessageW(c->track, TBM_SETPAGESIZE, 0, max(1, steps / 10));
+        set_control_value(c, read_setting(c));
+    }
+
+    if (!create_child(h, &s_tree_lights, 0, L"BUTTON", L"Enable tree lights",
+        WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX, 24, 180, 300, 30, ID_TREE_LIGHTS))
+        return FALSE;
+    SendMessageW(s_tree_lights, BM_SETCHECK,
+        GetPrivateProfileIntW(L"scene", L"tree_lights", 1, s_ini) ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    if (!create_child(h, &s_fps_defaults, 0, L"BUTTON", L"FPS Defaults",
+            WS_CHILD | WS_TABSTOP, 24, 278, 120, 32, ID_FPS_DEFAULTS))
+        return FALSE;
+    if (!create_child(h, &s_wallpaper_enabled, 0, L"BUTTON", L"Enable animated wallpaper",
+            WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX, 24, 322, 300, 30, ID_WALLPAPER_ENABLED) ||
+        !create_child(h, &s_run_at_startup, 0, L"BUTTON", L"Run at Windows startup",
+            WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX, 24, 356, 300, 30, ID_RUN_AT_STARTUP))
+        return FALSE;
+    SendMessageW(s_wallpaper_enabled, BM_SETCHECK,
+        GetPrivateProfileIntW(L"engine", L"enabled", 1, s_ini) ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(s_run_at_startup, BM_SETCHECK,
+        s_startup_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    HWND button;
+    if (!create_child(h, &button, 0, L"BUTTON", L"Randomize",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP, 20, 462, 100, 32, ID_RANDOMIZE) ||
+        !create_child(h, &button, 0, L"BUTTON", L"Defaults",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP, 130, 462, 90, 32, ID_DEFAULTS) ||
+        !create_child(h, &button, 0, L"BUTTON", L"Save",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 550, 462, 80, 32, ID_SAVE) ||
+        !create_child(h, &button, 0, L"BUTTON", L"Cancel",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP, 640, 462, 100, 32, ID_CLOSE))
+        return FALSE;
+
+    show_page(PAGE_SCREEN);
+    return TRUE;
+}
+
+static LRESULT CALLBACK settings_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_CREATE:
+        if (!build_controls(h)) {
+            s_build_failed = TRUE;
+            return -1;
+        }
+        return 0;
+    case WM_ERASEBKGND: {
+        RECT client;
+        GetClientRect(h, &client);
+        FillRect((HDC)w, &client, s_background_brush);
+        return 1;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT client, header;
+        GetClientRect(h, &client);
+        header.left = 0;
+        header.top = 0;
+        header.right = client.right;
+        header.bottom = px(68);
+        FillRect(dc, &header, s_header_brush);
+        RECT accent = { 0, px(65), client.right, px(68) };
+        FillRect(dc, &accent, s_accent_brush);
+        if (s_app_icon)
+            DrawIconEx(dc, px(18), px(12), s_app_icon, px(44), px(44), 0, NULL, DI_NORMAL);
+        int saved = SaveDC(dc);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+        if (s_header_font) SelectObject(dc, s_header_font);
+        TextOutW(dc, px(76), px(13), L"Winter Campfire", 15);
+        SetTextColor(dc, RGB(199, 218, 237));
+        if (s_subtitle_font) SelectObject(dc, s_subtitle_font);
+        TextOutW(dc, px(76), px(37), L"Personalize your ASCII wallpaper", 32);
+        RestoreDC(dc, saved);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC:
+        SetBkMode((HDC)w, OPAQUE);
+        SetBkColor((HDC)w, s_background_color);
+        SetTextColor((HDC)w, RGB(36, 42, 50));
+        return (LRESULT)s_background_brush;
+    case WM_CTLCOLOREDIT:
+        SetBkMode((HDC)w, OPAQUE);
+        SetBkColor((HDC)w, RGB(255, 255, 255));
+        SetTextColor((HDC)w, RGB(36, 42, 50));
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    case WM_CTLCOLORBTN:
+        SetBkMode((HDC)w, TRANSPARENT);
+        return (LRESULT)s_background_brush;
+    case WM_NOTIFY:
+        if (((NMHDR *)l)->idFrom == ID_TAB && ((NMHDR *)l)->code == TCN_SELCHANGE)
+            show_page(TabCtrl_GetCurSel(s_tab));
+        return 0;
+    case WM_HSCROLL:
+        for (int i = 0; i < ARRAYSIZE(s_controls); i++) {
+            if ((HWND)l == s_controls[i].track) {
+                set_control_value(&s_controls[i], control_value(&s_controls[i]));
+                if (!wcscmp(s_controls[i].key, L"tree_count")) update_tree_dependencies();
+                if (!wcscmp(s_controls[i].key, L"tree_light_count")) update_tree_dependencies();
+                break;
+            }
+        }
+        return 0;
+    case WM_COMMAND:
+        if (HIWORD(w) == EN_KILLFOCUS &&
+            LOWORD(w) >= ID_VALUE_BASE &&
+            LOWORD(w) < ID_VALUE_BASE + ARRAYSIZE(s_controls)) {
+            commit_value_edit(LOWORD(w) - ID_VALUE_BASE);
+            return 0;
+        }
+        switch (LOWORD(w)) {
+        case ID_SAVE: save_settings(); return 0;
+        case ID_RANDOMIZE: randomize_settings(); return 0;
+        case ID_DEFAULTS: apply_defaults(); return 0;
+        case ID_FPS_DEFAULTS: apply_fps_defaults(); return 0;
+        case ID_CLOSE: DestroyWindow(h); return 0;
+        case ID_TREE_LIGHTS: update_tree_dependencies(); return 0;
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(h);
+        return 0;
+    case WM_DESTROY:
+        s_window = NULL;
+        s_tab = NULL;
+        s_tree_lights = NULL;
+        s_fps_defaults = NULL;
+        s_wallpaper_enabled = NULL;
+        s_run_at_startup = NULL;
+        s_hint = NULL;
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+BOOL settings_ui_init(HINSTANCE instance) {
+    s_instance = instance;
+    INITCOMMONCONTROLSEX controls = { sizeof controls, ICC_BAR_CLASSES | ICC_TAB_CLASSES };
+    if (!InitCommonControlsEx(&controls)) return FALSE;
+    s_background_brush = CreateSolidBrush(s_background_color);
+    s_header_brush = CreateSolidBrush(RGB(20, 38, 61));
+    s_accent_brush = CreateSolidBrush(RGB(0, 120, 215));
+    s_app_icon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP_ICON));
+    if (!s_app_icon) s_app_icon = LoadIconW(NULL, IDI_APPLICATION);
+    if (!s_background_brush || !s_header_brush || !s_accent_brush) return FALSE;
+
+    WNDCLASSW wc = { 0 };
+    wc.lpfnWndProc = settings_proc;
+    wc.hInstance = instance;
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.hIcon = s_app_icon;
+    wc.hbrBackground = s_background_brush;
+    wc.lpszClassName = CLS_SETTINGS;
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return FALSE;
+    return TRUE;
+}
+
+void settings_ui_show(HWND owner, const WCHAR *ini, SettingsReloadFn reload,
+                      SettingsStartupFn set_startup, BOOL startup_enabled) {
+    if (s_window) {
+        ShowWindow(s_window, SW_RESTORE);
+        SetForegroundWindow(s_window);
+        return;
+    }
+    s_ini = ini;
+    s_reload = reload;
+    s_set_startup = set_startup;
+    s_startup_enabled = startup_enabled;
+    s_scale = GetDpiForSystem() * 100 / 96;
+    if (!s_font) {
+        s_font = CreateFontW(-px(10), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        s_value_font = CreateFontW(-px(10), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        s_header_font = CreateFontW(-px(15), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        s_subtitle_font = CreateFontW(-px(9), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    }
+    srand(GetTickCount() ^ GetCurrentProcessId());
+    s_build_failed = FALSE;
+    RECT r = { 0, 0, px(SETTINGS_WIDTH), px(SETTINGS_HEIGHT) };
+    AdjustWindowRectEx(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                       FALSE, WS_EX_APPWINDOW);
+    HWND h = CreateWindowExW(WS_EX_APPWINDOW, CLS_SETTINGS, L"AsciiWall Settings",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
+        owner, NULL, s_instance, NULL);
+    if (!h || s_build_failed) {
+        MessageBoxW(owner, L"Could not create the settings window.", L"AsciiWall",
+                    MB_OK | MB_ICONERROR);
+        return;
+    }
+    s_window = h;
+    ShowWindow(h, SW_SHOWNORMAL);
+    UpdateWindow(h);
+}
+
+void settings_ui_close(void) {
+    if (s_window) DestroyWindow(s_window);
+    if (s_font) { DeleteObject(s_font); s_font = NULL; }
+    if (s_value_font) { DeleteObject(s_value_font); s_value_font = NULL; }
+    if (s_header_font) { DeleteObject(s_header_font); s_header_font = NULL; }
+    if (s_subtitle_font) { DeleteObject(s_subtitle_font); s_subtitle_font = NULL; }
+    if (s_background_brush) { DeleteObject(s_background_brush); s_background_brush = NULL; }
+    if (s_header_brush) { DeleteObject(s_header_brush); s_header_brush = NULL; }
+    if (s_accent_brush) { DeleteObject(s_accent_brush); s_accent_brush = NULL; }
+}

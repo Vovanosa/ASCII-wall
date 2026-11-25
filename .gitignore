@@ -1,0 +1,10 @@
+/build/
+/dist/asciiwall.exe
+*.o
+*.obj
+*.pdb
+*.ilk
+*.log
+.vs/
+Thumbs.db
+Desktop.ini
