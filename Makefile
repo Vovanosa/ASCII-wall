@@ -1,6 +1,6 @@
 .RECIPEPREFIX := >
 CC      := gcc
-VERSION ?= 0.1.3
+VERSION ?= 0.1.4
 CFLAGS  := -O2 -Wall -DNDEBUG -Ilua -DASCIIWALL_VERSION=\"$(VERSION)\"
 LDFLAGS := -s -static -mwindows -municode
 LIBS    := -luser32 -lgdi32 -ladvapi32 -lwtsapi32 -ldwmapi -lshell32 -lcomctl32

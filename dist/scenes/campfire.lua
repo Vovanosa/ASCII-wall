@@ -5,15 +5,17 @@
 --   fill(x, y, w, h, ch [, fg [, bg]])
 --   clear([bg])
 --   scene_value(name [, default])
+-- update(t, dt, input) receives mouse position/speed and button state in cell coordinates.
 -- Engine/render frame rate is independent from every animation speed below.
 
 font = { name = "Consolas", size = 14 }
 background = 0x070a14
 
-local rand, floor, ceil, abs, sin, sqrt, exp =
-  math.random, math.floor, math.ceil, math.abs, math.sin, math.sqrt, math.exp
+local rand, floor, ceil, abs, sin, cos, sqrt, exp =
+  math.random, math.floor, math.ceil, math.abs, math.sin, math.cos, math.sqrt, math.exp
 local min, max = math.min, math.max
 local LIGHT_COLORS = { 0xffd34e, 0xff5148, 0x55aaff, 0x55ed69 }
+local MAX_INTERACTION_FLAKES = 160
 
 local function clamp(v, lo, hi)
   return v < lo and lo or (v > hi and hi or v)
@@ -58,8 +60,12 @@ end
 local W, H, GY, FW, FH, FX, FY, DECAY
 local heat, stars, flakes, sparks, coals, trees = {}, {}, {}, {}, {}, {}
 local groundCh, groundD = {}, {}
+local groundTraces = {}
 local fireClock, glow, glowTimer = 0, 1, 0
 local coalTimer = 0
+local baseFlakeCount = 0
+local previousMouseX, previousMouseY
+local fireGust = { x = 0, y = 0, dx = 0, dy = 0, strength = 0 }
 local settings
 
 local function resetFlake(f, anywhere)
@@ -68,6 +74,9 @@ local function resetFlake(f, anywhere)
   f.y = anywhere and rand() * GY or -rand() * 4
   f.v = LAYER_V[l] * settings.snowSpeed * (0.8 + rand() * 0.4)
   f.ph, f.sw = rand() * 6.28, 0.6 + rand()
+  f.held, f.extra = false, false
+  f.holdX, f.holdY = nil, nil
+  f.kickX, f.kickY, f.kickTime = 0, 0, 0
   return f
 end
 
@@ -100,11 +109,16 @@ local function makeTree(x, scale)
   local h = floor(6 + scale * 5)
   local halfWidth = max(2, floor(h * 0.65))
   local width = halfWidth * 2 + 1
+  local snowRows = settings.treeSnow > 0
+    and max(1, floor(h * settings.treeSnow + 0.5)) or 0
   return {
     x = x - halfWidth,
     h = h,
     width = width,
     halfWidth = halfWidth,
+    snowRows = snowRows,
+    maxSnowRows = snowRows,
+    snowRegenTimer = 0,
     lit = false,
     lights = {}
   }
@@ -140,9 +154,10 @@ local function drawTree(tree, top, t)
     local yy = top + row
     if yy >= 0 and yy < GY then
       if row == 0 then
-        put(cx, yy, "^", 0xdce6f5)
+        local color = tree.snowRows > 0 and 0xdce6f5 or 0x1f4d3a
+        put(cx, yy, "^", color)
       else
-        local snow = row == 1
+        local snow = row < tree.snowRows
         for xx = cx - half, cx + half do
           if xx >= 0 and xx < W then
             local edge = xx == cx - half or xx == cx + half
@@ -185,6 +200,11 @@ function init()
     firePower = clamp(cfg("fire_power", 1), 0, 3),
     fireSpeed = clamp(cfg("fire_speed", 1), 0, 5) / 4,
     fireWidth = clamp(cfg("fire_width", 1), 0.25, 3),
+    mouseFirePower = clamp(cfg("mouse_fire_power", 1), 0, 3),
+    mouseSnowRadius = clamp(cfg("mouse_snow_radius", 7), 1, 12),
+    mouseSnowPull = clamp(cfg("mouse_snow_pull", 1), 0.1, 3),
+    mouseSnowLimit = floor(clamp(cfg("mouse_snow_limit", 36), 1, 72) + 0.5),
+    treeShakePower = clamp(cfg("tree_shake_power", 1), 0, 3),
     treeCount = floor(clamp(cfg("tree_count", 10), 0, 20) + 0.5),
     treeJitter = clamp(cfg("tree_jitter", 0.25), 0, 0.45),
     treeLightCount = floor(clamp(cfg("tree_light_count", 4), 0, 20) + 0.5),
@@ -192,7 +212,10 @@ function init()
     treeMin = clamp(cfg("tree_min_scale", 0.75), 0.35, 3),
     treeMax = max(clamp(cfg("tree_max_scale", 1.9), 0.35, 4),
                   clamp(cfg("tree_min_scale", 0.75), 0.35, 3)),
+    treeSnow = clamp(cfg("tree_snow", 0.15), 0, 1),
     treeLightInterval = clamp(cfg("tree_light_interval", 1.5), 0.25, 30),
+    groundTraceSeconds = clamp(cfg("ground_trace_seconds", 10), 1, 60),
+    groundTracePermanent = cfg("ground_trace_permanent", 0) > 0,
     coalRate = max(0, cfg("coal_rate", 0.35)),
     glowPower = clamp(cfg("glow_power", 1), 0, 3)
   }
@@ -223,6 +246,7 @@ function init()
   flakes = {}
   local flakeCount = floor(W * GY / 60 * settings.snowDensity)
   for i = 1, flakeCount do flakes[i] = resetFlake({}, true) end
+  baseFlakeCount = #flakes
 
   trees = {}
   if settings.treeCount > 0 then
@@ -272,10 +296,200 @@ function init()
     end
   end
   sparks, coals = {}, {}
+  groundTraces = {}
+  previousMouseX, previousMouseY = nil, nil
+  fireGust = { x = 0, y = 0, dx = 0, dy = 0, strength = 0 }
   fireClock, glowTimer, coalTimer = 0, 0, 0
 end
 
-function update(t, dt)
+local function add_falling_snow(x, y, count, halfWidth, burst)
+  local limit = baseFlakeCount + MAX_INTERACTION_FLAKES
+  for _ = 1, count do
+    if #flakes >= limit then break end
+    local l = rand(1, 3)
+    local spread = max(1, halfWidth)
+    flakes[#flakes + 1] = {
+      x = clamp(x + (rand() * 2 - 1) * spread, 0, W - 1),
+      y = y + rand() * (burst and max(1, spread * 0.8) or 0.4),
+      l = l,
+      v = LAYER_V[l] * settings.snowSpeed * (0.8 + rand() * 0.4),
+      ph = rand() * 6.28,
+      sw = 0.6 + rand(),
+      extra = true,
+      life = 8,
+      kickX = (rand() * 2 - 1) * (burst and (3 + spread * 0.65) or 1.5),
+      kickY = burst and -(1.5 + rand() * 2.5) or 0,
+      kickTime = burst and 0.9 or 0.35
+    }
+  end
+end
+
+local function tree_at(x, y)
+  for i = #trees, 1, -1 do
+    local tree = trees[i]
+    local top = GY - tree.h - 2
+    if x >= tree.x and x < tree.x + tree.width
+      and y >= top and y < top + tree.h then
+      return tree, top
+    end
+  end
+end
+
+local function shed_tree_snow(tree, top)
+  local row = tree.snowRows - 1
+  local half = row == 0 and 0
+    or min(tree.halfWidth, ceil(row * tree.halfWidth / (tree.h - 1)))
+  local center = tree.x + floor(tree.width / 2)
+  tree.snowRows = row
+  tree.snowRegenTimer = 0
+  local count = floor(min(72, (42 + tree.h * 2) * settings.treeShakePower) + 0.5)
+  if count > 0 then
+    add_falling_snow(center, top + row, count, max(half, tree.halfWidth), true)
+  end
+end
+
+local function handle_mouse_press(input)
+  local tree, top = tree_at(input.x, input.y)
+  if tree and tree.snowRows > 0 then
+    shed_tree_snow(tree, top)
+  end
+end
+
+local function update_tree_snow(dt)
+  if settings.snowDensity <= 0 or settings.snowSpeed <= 0 then return end
+  local accumulation = min(2, settings.snowDensity) * min(2, settings.snowSpeed)
+  for _, tree in ipairs(trees) do
+    if tree.snowRows < tree.maxSnowRows then
+      tree.snowRegenTimer = tree.snowRegenTimer + dt * accumulation
+      while tree.snowRegenTimer >= 35 and tree.snowRows < tree.maxSnowRows do
+        tree.snowRows = tree.snowRows + 1
+        tree.snowRegenTimer = tree.snowRegenTimer - 35
+      end
+    else
+      tree.snowRegenTimer = 0
+    end
+  end
+end
+
+local function add_ground_trace(x, y, t)
+  x, y = floor(x + 0.5), floor(y + 0.5)
+  if x < 0 or x >= W or y < GY or y >= ROWS then return end
+  local index = (y - GY) * W + x + 1
+  groundTraces[index] = settings.groundTracePermanent and -1 or t + settings.groundTraceSeconds
+end
+
+local function update_ground_trace(input, t)
+  if not input.inside then
+    previousMouseX, previousMouseY = nil, nil
+    return
+  end
+  if input.moved then
+    local x0, y0 = previousMouseX or input.x, previousMouseY or input.y
+    local dx, dy = input.x - x0, input.y - y0
+    local steps = min(256, max(1, ceil(max(abs(dx), abs(dy)))))
+    for i = 0, steps do
+      local k = i / steps
+      add_ground_trace(x0 + dx * k, y0 + dy * k, t)
+    end
+  end
+  previousMouseX, previousMouseY = input.x, input.y
+end
+
+local function update_fire_gust(input, dt)
+  fireGust.strength = fireGust.strength * exp(-dt * 0.9)
+  local speed = sqrt(input.vx * input.vx + input.vy * input.vy)
+  if not input.moved or speed <= 0.1 then return end
+
+  local moveX, moveY = input.dx, input.dy
+  local distance = sqrt(moveX * moveX + moveY * moveY)
+  if distance < 0.01 then
+    moveX, moveY, distance = input.vx, input.vy, speed
+  end
+  local startX, startY = input.x - moveX, input.y - moveY
+  local samples = min(64, max(1, ceil(distance)))
+  local bestDistance, hitX, hitY = math.huge, nil, nil
+  local fireCenterX, fireCenterY = FX + FW / 2, FY + FH / 2
+  for i = 0, samples do
+    local k = i / samples
+    local x, y = startX + moveX * k, startY + moveY * k
+    if x >= FX - 2 and x < FX + FW + 2 and y >= FY - 2 and y < GY then
+      local dx, dy = (x - fireCenterX) / FW, (y - fireCenterY) / FH
+      local d = dx * dx + dy * dy
+      if d < bestDistance then
+        bestDistance, hitX, hitY = d, x, y
+      end
+    end
+  end
+  if hitX then
+    fireGust.x, fireGust.y = hitX, hitY
+    fireGust.dx, fireGust.dy = moveX / distance, moveY / distance
+    fireGust.strength = max(fireGust.strength,
+      min(3.2, speed / 9) * settings.mouseFirePower)
+  end
+end
+
+local function update_mouse_flakes(input, dt, t)
+  if input.pressed then handle_mouse_press(input) end
+
+  local gather = input.inside and input.down
+  local held = 0
+  for _, f in ipairs(flakes) do
+    if f.held then
+      if gather then
+        held = held + 1
+      else
+        f.held, f.holdX, f.holdY = false, nil, nil
+      end
+    end
+  end
+  if gather and held < settings.mouseSnowLimit then
+    for _, f in ipairs(flakes) do
+      if not f.held and held < settings.mouseSnowLimit then
+        local dx, dy = f.x - input.x, f.y - input.y
+        if dx * dx + dy * dy <= settings.mouseSnowRadius ^ 2 then
+          f.held = true
+          f.holdX, f.holdY = dx * 0.35, dy * 0.35
+          held = held + 1
+        end
+      end
+    end
+  end
+
+  for i = #flakes, 1, -1 do
+    local f = flakes[i]
+    if f.held then
+      local pull = min(1, dt * 10 * settings.mouseSnowPull)
+      f.x = f.x + (input.x + f.holdX - f.x) * pull
+      f.y = f.y + (input.y + f.holdY - f.y) * pull
+    else
+      if f.kickTime > 0 then
+        f.kickTime = max(0, f.kickTime - dt)
+        f.kickX = f.kickX * exp(-2.4 * dt)
+        f.kickY = f.kickY + 8 * dt
+        if f.kickTime == 0 then f.kickX, f.kickY = 0, 0 end
+      end
+      f.x = (f.x + (settings.wind
+        + sin(t * f.sw + f.ph) * 0.4 * f.l * settings.snowDrift
+        + f.kickX) * dt) % W
+      f.y = f.y + (f.v + f.kickY) * dt
+    end
+
+    if f.extra and not f.held then f.life = f.life - dt end
+    if f.extra and (f.y >= GY or f.life <= 0) then
+      flakes[i] = flakes[#flakes]
+      flakes[#flakes] = nil
+    else
+      if not f.extra and not f.held and f.y >= GY then resetFlake(f, false) end
+      put(f.x, f.y, LAYER_CH[f.l], LAYER_COL[f.l])
+    end
+  end
+end
+
+function update(t, dt, input)
+  input = input or {
+    inside = false, down = false, pressed = false, moved = false,
+    x = 0, y = 0, vx = 0, vy = 0
+  }
   clear(background)
 
   for _, s in ipairs(stars) do
@@ -284,17 +498,14 @@ function update(t, dt)
     put(s.x, s.y, bright and "+" or ".", bright and s.bright or s.color)
   end
 
+  update_ground_trace(input, t)
+  update_fire_gust(input, dt)
+  update_tree_snow(dt)
   for _, tree in ipairs(trees) do
     local top = GY - tree.h - 2
     drawTree(tree, top, t)
   end
-
-  for _, f in ipairs(flakes) do
-    f.y = f.y + f.v * dt
-    f.x = (f.x + (settings.wind + sin(t * f.sw + f.ph) * 0.4 * f.l * settings.snowDrift) * dt) % W
-    if f.y >= GY then resetFlake(f, false) end
-    put(f.x, f.y, LAYER_CH[f.l], LAYER_COL[f.l])
-  end
+  update_mouse_flakes(input, dt, t)
 
   glowTimer = glowTimer - dt
   if glowTimer <= 0 then
@@ -307,7 +518,16 @@ function update(t, dt)
     for x = 0, W - 1 do
       local i = row + x
       local l = min(6, floor(max(0, 1 - groundD[i]) * glow * 6))
-      put(x, y, groundCh[i], GROUND_FG[l], GROUND_BG[l])
+      local bg = GROUND_BG[l]
+      put(x, y, groundCh[i], GROUND_FG[l], bg)
+      local traceExpiry = groundTraces[i + 1]
+      if traceExpiry then
+        if traceExpiry == -1 or traceExpiry > t then
+          put(x, y, "*", 0x111827, bg)
+        else
+          groundTraces[i + 1] = nil
+        end
+      end
     end
   end
 
@@ -338,13 +558,18 @@ function update(t, dt)
     fireClock = fireClock - 1 / 30
   end
   for y = 0, FH - 1 do
-    local row = y * FW
     local windShift = floor(settings.wind * 0.035 * (FH - 1 - y) + 0.5)
     local vertical = y / max(1, FH - 1)
     local halfWidth = FW * 0.5 * (0.15 + 0.85 * vertical ^ 0.78)
     local center = (FW - 1) * 0.5
     for x = 0, FW - 1 do
-      local h = clamp(floor(heat[row + x] or 0), 0, MAXH)
+      local screenX, screenY = FX + x, FY + y
+      local dx, dy = (screenX - fireGust.x) / 5, (screenY - fireGust.y) / 3
+      local influence = exp(-(dx * dx + dy * dy)) * fireGust.strength
+      local warp = 4 * influence
+      local sourceX = clamp(x - floor(fireGust.dx * warp + 0.5), 0, FW - 1)
+      local sourceY = clamp(y - floor(fireGust.dy * warp + 0.5), 0, FH - 1)
+      local h = clamp(floor(heat[sourceY * FW + sourceX] or 0) - floor(influence * 10), 0, MAXH)
       if h > 3 and abs(x - center) <= halfWidth then
         local ch = fireCh[h] or " "
         put(FX + x + windShift, FY + y, ch, fireCol[h] or 0xff8420)

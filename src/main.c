@@ -9,6 +9,7 @@
 #define WINVER       0x0A00
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
+#include <windowsx.h>
 #include <wtsapi32.h>
 #include <dwmapi.h>
 #include <shellapi.h>
@@ -42,12 +43,17 @@ enum { TM_RELOAD = 1, TM_OCCLUDE, TM_REATTACH };
 #define RGBX(v) RGB(((v) >> 16) & 255, ((v) >> 8) & 255, (v) & 255)   /* 0xRRGGBB -> COLORREF */
 
 typedef struct { WCHAR ch; COLORREF fg, bg; } Cell;
+typedef struct {
+    double x, y, dx, dy, vx, vy;
+    BOOL inside, left_down, pressed, moved, has_last_move;
+    LARGE_INTEGER last_move;
+} MouseInput;
 
 static const GUID kDisplayState = {0x6fe69556,0x704a,0x47a0,{0x8f,0x24,0xc2,0x8d,0x93,0x6f,0xda,0x47}};
 static const GUID kAcDc         = {0x5d3e9a59,0xe9d5,0x4b00,{0xa6,0xbd,0xff,0x34,0xff,0x51,0x65,0x48}};
 
 static struct {
-    HWND ctl, wall;                     /* приховане керуюче вікно; вікно шпалер */
+    HWND ctl, wall;                      /* приховане керуюче вікно; вікно шпалер */
     UINT msg_taskbar;
     NOTIFYICONDATAW tray;
     BOOL tray_added;
@@ -63,10 +69,17 @@ static struct {
     FILETIME ini_time, scene_time;
     int fps, fps_battery;
     BOOL enabled, locked, display_off, covered, on_battery, running;
-    BOOL screen_saver;
+    BOOL screen_saver, mouse_interactions;
+    HHOOK mouse_hook;
+    MouseInput mouse;
     POINT input_origin;
     LARGE_INTEGER qpf, t0, tprev;
 } g;
+
+static void reset_mouse_input(void) {
+    memset(&g.mouse, 0, sizeof g.mouse);
+}
+static void update_mouse_hook(void);
 
 typedef struct {
     DWORD type, size;
@@ -150,7 +163,11 @@ static void set_running(BOOL force) {
     BOOL run = visible && !g.locked && !g.display_off && !g.covered;
     if (run == g.running && !force) return;
     g.running = run;
-    if (!run) { CancelWaitableTimer(g.frame_timer); return; }
+    if (!run) {
+        CancelWaitableTimer(g.frame_timer);
+        reset_mouse_input();
+        return;
+    }
     int fps = g.on_battery ? g.fps_battery : g.fps;
     if (fps < 1) fps = 1;
     if (fps > 60) fps = 60;
@@ -350,6 +367,8 @@ static void load_scene(void) {
     if (!call_init(L)) { lua_close(L); return; }
     if (g.L) lua_close(g.L);
     g.L = L; g.scene_ok = TRUE; g.err[0] = 0; g.full_redraw = TRUE;
+    if (!g.screen_saver && g.mouse_interactions && !g.mouse_hook)
+        set_err("could not enable mouse interactions");
 }
 
 static void read_ini(void) {
@@ -360,13 +379,20 @@ static void read_ini(void) {
     g.fps         = GetPrivateProfileIntW(L"engine", L"fps", 15, g.ini);
     g.fps_battery = GetPrivateProfileIntW(L"engine", L"fps_battery", 8, g.ini);
     g.enabled     = GetPrivateProfileIntW(L"engine", L"enabled", 1, g.ini) != 0;
+    g.mouse_interactions =
+        GetPrivateProfileIntW(L"engine", L"mouse_interactions", 1, g.ini) != 0;
+    reset_mouse_input();
     g.ini_time = file_time(g.ini);
 }
 
 static void check_reload(void) {
     FILETIME ti = file_time(g.ini), ts;
     BOOL ini_changed = CompareFileTime(&ti, &g.ini_time) != 0;
-    if (ini_changed) { read_ini(); set_running(TRUE); }
+    if (ini_changed) {
+        read_ini();
+        update_mouse_hook();
+        set_running(TRUE);
+    }
     ts = file_time(g.scene);
     if (ini_changed || CompareFileTime(&ts, &g.scene_time) != 0) load_scene();
 }
@@ -449,6 +475,103 @@ static void CALLBACK on_win_event(HWINEVENTHOOK hk, DWORD ev, HWND h, LONG obj, 
 
 /* ───────────── кадр і розкладка ───────────── */
 
+static void update_mouse_input(POINT screen, BOOL over_desktop) {
+    int px = screen.x - g.mon.left, py = screen.y - g.mon.top;
+    double x = (double)px / max(1, g.cw);
+    double y = (double)py / max(1, g.chh);
+    BOOL inside = over_desktop && px >= 0 && py >= 0
+        && x < g.cols && y < g.vis_rows;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+
+    if (inside && g.mouse.inside) {
+        double dx = x - g.mouse.x, dy = y - g.mouse.y;
+        if (dx != 0 || dy != 0) {
+            double elapsed = g.mouse.has_last_move
+                ? (double)(now.QuadPart - g.mouse.last_move.QuadPart) / g.qpf.QuadPart
+                : 0;
+            g.mouse.dx += dx;
+            g.mouse.dy += dy;
+            g.mouse.moved = TRUE;
+            if (elapsed > 0.001) {
+                double vx = dx / elapsed, vy = dy / elapsed;
+                if (vx * vx + vy * vy > g.mouse.vx * g.mouse.vx + g.mouse.vy * g.mouse.vy) {
+                    g.mouse.vx = vx;
+                    g.mouse.vy = vy;
+                }
+            }
+        }
+    }
+    if (inside) {
+        g.mouse.x = x;
+        g.mouse.y = y;
+    }
+    g.mouse.inside = inside;
+    g.mouse.last_move = now;
+    g.mouse.has_last_move = TRUE;
+}
+
+static BOOL cursor_over_desktop(POINT p) {
+    HWND window = WindowFromPoint(p);
+    HWND root = window ? GetAncestor(window, GA_ROOT) : NULL;
+    WCHAR class_name[32];
+    if (!root || !GetClassNameW(root, class_name, ARRAYSIZE(class_name))) return FALSE;
+    return !wcscmp(class_name, L"Progman") || !wcscmp(class_name, L"WorkerW");
+}
+
+static LRESULT CALLBACK mouse_hook_proc(int code, WPARAM message, LPARAM data) {
+    if (code >= 0 && g.mouse_interactions && !g.screen_saver &&
+        (message == WM_MOUSEMOVE || message == WM_LBUTTONDOWN || message == WM_LBUTTONUP)) {
+        const MSLLHOOKSTRUCT *event = (const MSLLHOOKSTRUCT *)data;
+        BOOL over_desktop = cursor_over_desktop(event->pt);
+        update_mouse_input(event->pt, over_desktop);
+        if (message == WM_LBUTTONDOWN) {
+            g.mouse.left_down = over_desktop;
+            if (over_desktop) g.mouse.pressed = TRUE;
+        } else if (message == WM_LBUTTONUP) {
+            g.mouse.left_down = FALSE;
+        }
+    }
+    return CallNextHookEx(g.mouse_hook, code, message, data);
+}
+
+static void update_mouse_hook(void) {
+    BOOL needed = g.mouse_interactions && !g.screen_saver;
+    if (needed && !g.mouse_hook) {
+        g.mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, mouse_hook_proc,
+                                         GetModuleHandleW(NULL), 0);
+        if (!g.mouse_hook) set_err("could not enable mouse interactions");
+    } else if (!needed && g.mouse_hook) {
+        if (UnhookWindowsHookEx(g.mouse_hook)) g.mouse_hook = NULL;
+        else set_err("could not disable mouse interactions");
+    }
+    if (!needed) reset_mouse_input();
+}
+
+static void push_mouse_input(lua_State *L) {
+    lua_createtable(L, 0, 10);
+    lua_pushboolean(L, g.mouse_interactions && g.mouse.inside);
+    lua_setfield(L, -2, "inside");
+    lua_pushboolean(L, g.mouse_interactions && g.mouse.left_down);
+    lua_setfield(L, -2, "down");
+    lua_pushboolean(L, g.mouse_interactions && g.mouse.pressed);
+    lua_setfield(L, -2, "pressed");
+    lua_pushboolean(L, g.mouse_interactions && g.mouse.moved);
+    lua_setfield(L, -2, "moved");
+    lua_pushnumber(L, g.mouse.x);
+    lua_setfield(L, -2, "x");
+    lua_pushnumber(L, g.mouse.y);
+    lua_setfield(L, -2, "y");
+    lua_pushnumber(L, g.mouse.dx);
+    lua_setfield(L, -2, "dx");
+    lua_pushnumber(L, g.mouse.dy);
+    lua_setfield(L, -2, "dy");
+    lua_pushnumber(L, g.mouse.vx);
+    lua_setfield(L, -2, "vx");
+    lua_pushnumber(L, g.mouse.vy);
+    lua_setfield(L, -2, "vy");
+}
+
 static void tick(void) {
     if (!g.wall || !g.back) return;
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
@@ -459,11 +582,14 @@ static void tick(void) {
     if (g.L && g.scene_ok) {
         lua_getglobal(g.L, "update");
         lua_pushnumber(g.L, t); lua_pushnumber(g.L, dt);
-        if (lua_pcall(g.L, 2, 0, 0) != LUA_OK) {
+        push_mouse_input(g.L);
+        if (lua_pcall(g.L, 3, 0, 0) != LUA_OK) {
             set_err(lua_tostring(g.L, -1)); lua_pop(g.L, 1);
             g.scene_ok = FALSE;                              /* чекаємо на виправлення файлу */
         }
     }
+    g.mouse.dx = g.mouse.dy = g.mouse.vx = g.mouse.vy = 0;
+    g.mouse.pressed = g.mouse.moved = FALSE;
     draw_err();
     HDC dc = GetDC(g.wall); present(dc); ReleaseDC(g.wall, dc);
 }
@@ -488,7 +614,8 @@ static void relayout(void) {          /* зміна роздільності / �
 static LRESULT CALLBACK wall_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_ERASEBKGND: return 1;
-    case WM_NCHITTEST:  return g.screen_saver ? HTCLIENT : HTTRANSPARENT;
+    case WM_NCHITTEST:
+        return g.screen_saver ? HTCLIENT : HTTRANSPARENT;
     case WM_SETCURSOR:
         if (g.screen_saver) {
             SetCursor(NULL);
@@ -506,11 +633,22 @@ static LRESULT CALLBACK wall_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         break;
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
-    case WM_LBUTTONDOWN:
     case WM_RBUTTONDOWN:
     case WM_MBUTTONDOWN:
     case WM_XBUTTONDOWN:
     case WM_MOUSEWHEEL:
+        if (g.screen_saver) {
+            PostMessageW(g.ctl, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        break;
+    case WM_LBUTTONDOWN:
+        if (g.screen_saver) {
+            PostMessageW(g.ctl, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        break;
+    case WM_LBUTTONUP:
         if (g.screen_saver) {
             PostMessageW(g.ctl, WM_CLOSE, 0, 0);
             return 0;
@@ -1037,6 +1175,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cmd, int show) {
             return 1;
         }
     } else if (!attach()) SetTimer(g.ctl, TM_REATTACH, 2000, NULL);
+    update_mouse_hook();
     load_scene();
     if (screen_saver) {
         ShowWindow(g.wall, SW_SHOW);
@@ -1100,6 +1239,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cmd, int show) {
     }
 done:
     CancelWaitableTimer(g.frame_timer);
+    if (g.mouse_hook) UnhookWindowsHookEx(g.mouse_hook);
     if (g.dir_watch != INVALID_HANDLE_VALUE) FindCloseChangeNotification(g.dir_watch);
     if (g.ini_watch != INVALID_HANDLE_VALUE) FindCloseChangeNotification(g.ini_watch);
     if (g.wall) {                                          /* повернути звичайні шпалери */

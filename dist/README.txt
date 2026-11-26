@@ -13,12 +13,26 @@ icon. The shortcut starts AsciiWall if it is not already running.
 SETTINGS AND STARTUP
 Your active settings are stored in %APPDATA%\AsciiWall\settings.ini.
 The first launch copies the included settings.ini there if no settings file exists yet.
-Use the Screen settings to enable or disable the wallpaper and to control Windows startup.
-The separate Screensaver tab can select AsciiWall for this Windows account or start it
-immediately. This per-user option is not a named entry in Windows' screensaver picker;
-Windows' idle timeout and sign-in options remain unchanged.
+Settings are organized into General (Screen and Screensaver), Scene (Weather, Fire,
+Trees and Lights, Ground and Effects, and Size), and Interaction categories. Scene >
+Size selects Small, Medium, or Large and immediately applies that size's scene profile.
+Click Save to keep the changes. The size selection is saved and is not changed by Defaults.
+Search finds settings by name or keyword; results are alphabetized and paged. Selecting a
+result opens its page and focuses the control.
+Use General > Screen to enable or disable the wallpaper and control Windows startup.
+General > Screensaver can select AsciiWall for this Windows account or start it immediately.
+This per-user option is not a named entry in Windows' screensaver picker; Windows' idle
+timeout and sign-in options remain unchanged.
 Disabling AsciiWall restores the previous Windows screensaver selection unless you chose
 another saver in Windows while AsciiWall was enabled.
+
+INTERACTION
+Mouse interaction is enabled by default and does not capture clicks, so desktop icons
+remain usable. Hold the left mouse button to gather nearby snow; releasing it lets the
+snow fall. Moving the pointer alone does not attract snow. Clicking snowy trees shakes
+snow loose. The Interaction page controls fire gust power, snow attraction, the tree snow
+shower, and ground-trail lifetime. Trails fade after 10 seconds by default, can be set up
+to 60 seconds, or can be kept until the scene reloads.
 
 EXIT OR REMOVE
 To close AsciiWall, choose Exit AsciiWall from its tray menu.

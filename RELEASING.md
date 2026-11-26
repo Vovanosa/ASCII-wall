@@ -18,10 +18,10 @@ Building requires Windows x64 and w64devkit. Building the installer also require
 
 ```text
 make
-make package installer VERSION=0.1.3
+make package installer VERSION=0.1.4
 ```
 
-Replace `0.1.3` with the version you are preparing. The same value is shown in the Settings heading and used for the installer and package filenames.
+Replace `0.1.4` with the version you are preparing. The same value is shown in the Settings heading and used for the installer and package filenames.
 
 The outputs are:
 
@@ -37,25 +37,25 @@ Test the ZIP or installer before publishing. Use a clean Windows account, Sandbo
 You can make and push several commits to `main` without publishing a release. A release is built from the exact commit named by its version tag. Therefore, commit and push every change intended for that release before pushing its tag.
 The workflow file must be committed and pushed to `main` before the first release tag is pushed.
 
-For a release, replace `0.1.3` below with the next unused version:
+For a release, replace `0.1.4` below with the next unused version:
 
 ```powershell
 git status
 git add <the-files-you-reviewed>
 git diff --cached --check
 git diff --cached
-git commit -m "Prepare v0.1.3 release"
+git commit -m "Prepare v0.1.4 release"
 git push origin main
-git tag v0.1.3
-git push origin v0.1.3
+git tag v0.1.4
+git push origin v0.1.4
 ```
 
 For `git add`, replace the placeholder with the specific paths you reviewed; do not type angle brackets literally.
-The tag is the release version source for GitHub Actions: `v0.1.3` becomes `0.1.3` for the build. Pushing to `main` alone does not run the release workflow. All commits reachable from the tagged commit are included; later commits are not.
+The tag is the release version source for GitHub Actions: `v0.1.4` becomes `0.1.4` for the build. Pushing to `main` alone does not run the release workflow. All commits reachable from the tagged commit are included; later commits are not.
 
 Do not move or reuse a tag after its release has been published. Use a new version instead.
 
-As of 2026-11-25, `v0.1.2` is published; the next release should use `v0.1.3`.
+As of 2026-11-26, `v0.1.4` is the current release target. Confirm it is the next unused version before tagging.
 
 ## What the release workflow does
 
@@ -75,10 +75,10 @@ Only if the failed tag has **no GitHub Release**, you may retarget it to the fix
 
 ```powershell
 git fetch --tags origin
-git tag -d v0.1.3
-git push origin --delete v0.1.3
-git tag v0.1.3
-git push origin v0.1.3
+git tag -d v0.1.4
+git push origin --delete v0.1.4
+git tag v0.1.4
+git push origin v0.1.4
 ```
 
 Replace the example with the unpublished failed version. Never retarget a published release tag.
