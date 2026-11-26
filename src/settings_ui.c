@@ -31,12 +31,14 @@
 #define ID_FPS_DEFAULTS 106
 #define ID_WALLPAPER_ENABLED 107
 #define ID_RUN_AT_STARTUP 108
+#define ID_SCREENSAVER_ENABLED 109
+#define ID_START_SCREENSAVER 110
 #define ID_TRACK_BASE 200
 #define ID_VALUE_BASE 300
 #define SETTINGS_WIDTH 760
 #define SETTINGS_HEIGHT 510
 
-enum { PAGE_SCREEN, PAGE_WEATHER, PAGE_FIRE, PAGE_TREES, PAGE_GROUND, PAGE_COUNT };
+enum { PAGE_SCREEN, PAGE_SCREENSAVER, PAGE_WEATHER, PAGE_FIRE, PAGE_TREES, PAGE_GROUND, PAGE_COUNT };
 
 typedef struct {
     const WCHAR *key, *label, *section;
@@ -69,22 +71,26 @@ static SettingControl s_controls[] = {
 };
 
 static const WCHAR *s_pages[PAGE_COUNT] = {
-    L"Screen", L"Weather", L"Fire", L"Trees and Lights", L"Ground and Effects"
+    L"Screen", L"Screensaver", L"Weather", L"Fire", L"Trees and Lights", L"Ground and Effects"
 };
 static const WCHAR *s_page_hints[PAGE_COUNT] = {
     L"Set the frame rate for plugged-in and battery operation.",
+    L"Choose AsciiWall for this Windows account or start the screensaver now.",
     L"Adjust stars and snow. Typed values are clamped to their allowed range.",
     L"Adjust flame and wind. Type values or drag sliders; out-of-range values are clamped.",
     L"Set tree spacing and size. Turn on lights to edit their settings.",
     L"Control embers and snow glow. Type values or drag sliders; values are clamped."
 };
 static HWND s_window, s_tab, s_tree_lights, s_fps_defaults;
-static HWND s_wallpaper_enabled, s_run_at_startup, s_hint;
+static HWND s_wallpaper_enabled, s_run_at_startup, s_screensaver_enabled;
+static HWND s_start_screensaver, s_screensaver_hint, s_hint;
 static HINSTANCE s_instance;
 static const WCHAR *s_ini;
 static SettingsReloadFn s_reload;
 static SettingsStartupFn s_set_startup;
-static BOOL s_startup_enabled;
+static SettingsScreensaverFn s_set_screensaver;
+static SettingsScreensaverStartFn s_start_screensaver_now;
+static BOOL s_startup_enabled, s_screensaver_initial;
 static int s_scale = 100;
 static int s_current_page;
 static BOOL s_build_failed;
@@ -205,6 +211,9 @@ static void show_page(int page) {
     ShowWindow(s_fps_defaults, page == PAGE_SCREEN ? SW_SHOW : SW_HIDE);
     ShowWindow(s_wallpaper_enabled, page == PAGE_SCREEN ? SW_SHOW : SW_HIDE);
     ShowWindow(s_run_at_startup, page == PAGE_SCREEN ? SW_SHOW : SW_HIDE);
+    ShowWindow(s_screensaver_enabled, page == PAGE_SCREENSAVER ? SW_SHOW : SW_HIDE);
+    ShowWindow(s_start_screensaver, page == PAGE_SCREENSAVER ? SW_SHOW : SW_HIDE);
+    ShowWindow(s_screensaver_hint, page == PAGE_SCREENSAVER ? SW_SHOW : SW_HIDE);
     SetWindowTextW(s_hint, s_page_hints[page]);
     update_tree_dependencies();
 }
@@ -241,10 +250,22 @@ static void save_settings(void) {
     WritePrivateProfileStringW(NULL, NULL, NULL, s_ini);
     BOOL startup_saved = s_set_startup &&
         s_set_startup(SendMessageW(s_run_at_startup, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    BOOL screensaver_enabled =
+        SendMessageW(s_screensaver_enabled, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    BOOL screensaver_saved = TRUE;
+    if (screensaver_enabled != s_screensaver_initial) {
+        screensaver_saved = s_set_screensaver && s_set_screensaver(screensaver_enabled);
+        if (screensaver_saved) s_screensaver_initial = screensaver_enabled;
+    }
     if (s_reload) s_reload();
-    if (!startup_saved)
-        MessageBoxW(s_window, L"Settings were saved, but the Windows startup option could not be updated.",
-                    L"AsciiWall settings", MB_OK | MB_ICONERROR);
+    if (!startup_saved || !screensaver_saved) {
+        const WCHAR *message = !startup_saved && !screensaver_saved
+            ? L"Settings were saved, but the Windows startup and screensaver options could not both be updated."
+            : (!startup_saved
+                ? L"Settings were saved, but the Windows startup option could not be updated."
+                : L"Settings were saved, but the Windows screensaver option could not be updated.");
+        MessageBoxW(s_window, message, L"AsciiWall settings", MB_OK | MB_ICONERROR);
+    }
 }
 
 static void apply_defaults(void) {
@@ -357,10 +378,20 @@ static BOOL build_controls(HWND h) {
         !create_child(h, &s_run_at_startup, 0, L"BUTTON", L"Run at Windows startup",
             WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX, 24, 356, 300, 30, ID_RUN_AT_STARTUP))
         return FALSE;
+    if (!create_child(h, &s_screensaver_enabled, 0, L"BUTTON", L"Use AsciiWall as this account's screensaver",
+            WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX, 24, 180, 390, 30, ID_SCREENSAVER_ENABLED) ||
+        !create_child(h, &s_start_screensaver, 0, L"BUTTON", L"Start screensaver now",
+            WS_CHILD | WS_TABSTOP, 430, 179, 190, 32, ID_START_SCREENSAVER) ||
+        !create_child(h, &s_screensaver_hint, 0, L"STATIC",
+            L"This per-user saver is not listed in Windows' picker. Windows' idle timeout and sign-in options stay unchanged.",
+            WS_CHILD | SS_LEFT | SS_CENTERIMAGE, 24, 220, 712, 36, 0))
+        return FALSE;
     SendMessageW(s_wallpaper_enabled, BM_SETCHECK,
         GetPrivateProfileIntW(L"engine", L"enabled", 1, s_ini) ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(s_run_at_startup, BM_SETCHECK,
         s_startup_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(s_screensaver_enabled, BM_SETCHECK,
+        s_screensaver_initial ? BST_CHECKED : BST_UNCHECKED, 0);
 
     HWND button;
     if (!create_child(h, &button, 0, L"BUTTON", L"Randomize",
@@ -456,6 +487,11 @@ static LRESULT CALLBACK settings_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case ID_RANDOMIZE: randomize_settings(); return 0;
         case ID_DEFAULTS: apply_defaults(); return 0;
         case ID_FPS_DEFAULTS: apply_fps_defaults(); return 0;
+        case ID_START_SCREENSAVER:
+            if (!s_start_screensaver_now || !s_start_screensaver_now())
+                MessageBoxW(s_window, L"Could not start the AsciiWall screensaver. Make sure asciiwall.scr is beside asciiwall.exe.",
+                            L"AsciiWall", MB_OK | MB_ICONERROR);
+            return 0;
         case ID_CLOSE: DestroyWindow(h); return 0;
         case ID_TREE_LIGHTS: update_tree_dependencies(); return 0;
         }
@@ -470,6 +506,9 @@ static LRESULT CALLBACK settings_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         s_fps_defaults = NULL;
         s_wallpaper_enabled = NULL;
         s_run_at_startup = NULL;
+        s_screensaver_enabled = NULL;
+        s_start_screensaver = NULL;
+        s_screensaver_hint = NULL;
         s_hint = NULL;
         return 0;
     }
@@ -499,7 +538,9 @@ BOOL settings_ui_init(HINSTANCE instance) {
 }
 
 void settings_ui_show(HWND owner, const WCHAR *ini, SettingsReloadFn reload,
-                      SettingsStartupFn set_startup, BOOL startup_enabled) {
+                      SettingsStartupFn set_startup, BOOL startup_enabled,
+                      SettingsScreensaverFn set_screensaver, BOOL screensaver_enabled,
+                      SettingsScreensaverStartFn start_screensaver) {
     if (s_window) {
         ShowWindow(s_window, SW_RESTORE);
         SetForegroundWindow(s_window);
@@ -508,7 +549,10 @@ void settings_ui_show(HWND owner, const WCHAR *ini, SettingsReloadFn reload,
     s_ini = ini;
     s_reload = reload;
     s_set_startup = set_startup;
+    s_set_screensaver = set_screensaver;
+    s_start_screensaver_now = start_screensaver;
     s_startup_enabled = startup_enabled;
+    s_screensaver_initial = screensaver_enabled;
     s_scale = GetDpiForSystem() * 100 / 96;
     if (!s_font) {
         s_font = CreateFontW(-px(10), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,

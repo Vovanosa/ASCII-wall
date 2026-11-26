@@ -1,5 +1,6 @@
 /build/
 /dist/asciiwall.exe
+/dist/asciiwall.scr
 *.o
 *.obj
 *.pdb

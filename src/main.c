@@ -16,6 +16,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 #include "lua.h"
 #include "lauxlib.h"
 #include "lualib.h"
@@ -27,6 +28,7 @@
 #endif
 
 #define CLS_CTL  L"AsciiWall.Ctl"
+#define CLS_SAVER_CTL L"AsciiWall.SaverCtl"
 #define CLS_WALL L"AsciiWall.View"
 enum { TM_RELOAD = 1, TM_OCCLUDE, TM_REATTACH };
 #define WM_APP_TRAY (WM_APP + 1)
@@ -35,6 +37,8 @@ enum { TM_RELOAD = 1, TM_OCCLUDE, TM_REATTACH };
 #define ID_TRAY_EXIT 4002
 #define ID_TRAY_ICON 1
 #define IDI_APP_ICON 1
+#define SAVER_STATE_KEY L"Software\\AsciiWall\\ScreenSaver"
+#define DESKTOP_KEY L"Control Panel\\Desktop"
 #define RGBX(v) RGB(((v) >> 16) & 255, ((v) >> 8) & 255, (v) & 255)   /* 0xRRGGBB -> COLORREF */
 
 typedef struct { WCHAR ch; COLORREF fg, bg; } Cell;
@@ -59,8 +63,16 @@ static struct {
     FILETIME ini_time, scene_time;
     int fps, fps_battery;
     BOOL enabled, locked, display_off, covered, on_battery, running;
+    BOOL screen_saver;
+    POINT input_origin;
     LARGE_INTEGER qpf, t0, tprev;
 } g;
+
+typedef struct {
+    DWORD type, size;
+    BYTE *data;
+    BOOL present;
+} RegistryValue;
 
 /* ───────────── утиліти ───────────── */
 
@@ -127,7 +139,7 @@ static void set_err(const char *m) { lstrcpynA(g.err, m ? m : "unknown error", s
 
 /* Запуск/пауза. Пауза = таймер скасовано, потік спить у MsgWait без пробуджень. */
 static void set_running(BOOL force) {
-    BOOL visible = g.wall && g.enabled;
+    BOOL visible = g.wall && (g.screen_saver || g.enabled);
     if (g.wall && IsWindowVisible(g.wall) != visible) {
         HWND parent = visible ? NULL : GetParent(g.wall);
         ShowWindow(g.wall, visible ? SW_SHOWNA : SW_HIDE);
@@ -402,6 +414,16 @@ static BOOL attach(void) {
     return TRUE;
 }
 
+static BOOL create_screensaver_window(void) {
+    update_monitor();
+    g.work = g.mon;
+    GetCursorPos(&g.input_origin);
+    g.wall = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, CLS_WALL, L"AsciiWall",
+        WS_POPUP, g.mon.left, g.mon.top, g.mon.right - g.mon.left,
+        g.mon.bottom - g.mon.top, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    return g.wall != NULL;
+}
+
 /* Чи перекриває якесь вікно всю робочу область основного монітора? */
 static BOOL desktop_covered(void) {
     for (HWND h = GetTopWindow(NULL); h; h = GetWindow(h, GW_HWNDNEXT)) {
@@ -448,8 +470,16 @@ static void tick(void) {
 
 static void relayout(void) {          /* зміна роздільності / панелі задач */
     update_monitor();
+    if (g.screen_saver) g.work = g.mon;
     apply_font();
-    if (g.wall) place_wall(NULL, SWP_NOZORDER);
+    if (g.wall) {
+        if (g.screen_saver)
+            SetWindowPos(g.wall, HWND_TOPMOST, g.mon.left, g.mon.top,
+                         g.mon.right - g.mon.left, g.mon.bottom - g.mon.top,
+                         SWP_NOACTIVATE);
+        else
+            place_wall(NULL, SWP_NOZORDER);
+    }
     if (g.L && g.scene_ok) g.scene_ok = call_init(g.L);
 }
 
@@ -458,14 +488,46 @@ static void relayout(void) {          /* зміна роздільності / �
 static LRESULT CALLBACK wall_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_ERASEBKGND: return 1;
-    case WM_NCHITTEST:  return HTTRANSPARENT;
+    case WM_NCHITTEST:  return g.screen_saver ? HTCLIENT : HTTRANSPARENT;
+    case WM_SETCURSOR:
+        if (g.screen_saver) {
+            SetCursor(NULL);
+            return TRUE;
+        }
+        break;
+    case WM_MOUSEMOVE:
+        if (g.screen_saver) {
+            POINT p;
+            if (GetCursorPos(&p) &&
+                (abs(p.x - g.input_origin.x) >= 4 || abs(p.y - g.input_origin.y) >= 4))
+                PostMessageW(g.ctl, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        break;
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_XBUTTONDOWN:
+    case WM_MOUSEWHEEL:
+        if (g.screen_saver) {
+            PostMessageW(g.ctl, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        break;
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
         g.full_redraw = TRUE; present(dc);
         EndPaint(h, &ps); return 0;
     }
     case WM_DESTROY:                                   /* напр., Explorer упав */
-        if (h == g.wall) { g.wall = NULL; set_running(FALSE); }
+        if (h == g.wall) {
+            g.wall = NULL;
+            set_running(FALSE);
+            if (g.screen_saver && g.ctl && IsWindow(g.ctl))
+                PostMessageW(g.ctl, WM_CLOSE, 0, 0);
+        }
         return 0;
     }
     return DefWindowProcW(h, m, w, l);
@@ -473,15 +535,19 @@ static LRESULT CALLBACK wall_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 static BOOL autostart_set(BOOL on);
 static BOOL autostart_get(BOOL *on);
+static BOOL screensaver_set(BOOL on);
+static BOOL screensaver_get(BOOL *on);
+static BOOL screensaver_start_now(void);
 
 static void show_settings(void) {
-    BOOL startup_enabled = FALSE;
-    if (!autostart_get(&startup_enabled)) {
-        MessageBoxW(g.ctl, L"Could not read the Windows startup setting.",
+    BOOL startup_enabled = FALSE, screensaver_enabled = FALSE;
+    if (!autostart_get(&startup_enabled) || !screensaver_get(&screensaver_enabled)) {
+        MessageBoxW(g.ctl, L"Could not read a Windows startup or screensaver setting.",
                     L"AsciiWall", MB_OK | MB_ICONERROR);
         return;
     }
-    settings_ui_show(g.ctl, g.ini, check_reload, autostart_set, startup_enabled);
+    settings_ui_show(g.ctl, g.ini, check_reload, autostart_set, startup_enabled,
+                     screensaver_set, screensaver_enabled, screensaver_start_now);
 }
 
 static BOOL add_tray_icon(void) {
@@ -553,7 +619,7 @@ static LRESULT CALLBACK ctl_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         PostQuitMessage(0);
         return 0;
     }
-    if (g.msg_taskbar && m == g.msg_taskbar) {         /* Explorer перезапустився */
+    if (!g.screen_saver && g.msg_taskbar && m == g.msg_taskbar) { /* Explorer перезапустився */
         if (g.wall && IsWindow(g.wall)) DestroyWindow(g.wall);
         g.wall = NULL; set_running(FALSE);
         if (!add_tray_icon())
@@ -614,17 +680,307 @@ static BOOL autostart_get(BOOL *on) {
     return TRUE;
 }
 
+static BOOL registry_read_value(HKEY key, const WCHAR *name, RegistryValue *value) {
+    memset(value, 0, sizeof(*value));
+    DWORD size = 0, type = 0;
+    LSTATUS result = RegQueryValueExW(key, name, NULL, &type, NULL, &size);
+    if (result == ERROR_FILE_NOT_FOUND) return TRUE;
+    if (result != ERROR_SUCCESS) return FALSE;
+
+    BYTE *data = malloc(size ? size : 1);
+    if (!data) return FALSE;
+    result = RegQueryValueExW(key, name, NULL, &type, data, &size);
+    if (result != ERROR_SUCCESS) {
+        free(data);
+        return FALSE;
+    }
+    value->type = type;
+    value->size = size;
+    value->data = data;
+    value->present = TRUE;
+    return TRUE;
+}
+
+static void registry_value_free(RegistryValue *value) {
+    free(value->data);
+    memset(value, 0, sizeof(*value));
+}
+
+static BOOL screensaver_path(WCHAR *path, size_t capacity) {
+    WCHAR module[MAX_PATH];
+    DWORD length = GetModuleFileNameW(NULL, module, ARRAYSIZE(module));
+    if (!length || length >= ARRAYSIZE(module)) return FALSE;
+    WCHAR *slash = wcsrchr(module, L'\\');
+    if (!slash) return FALSE;
+    *slash = 0;
+    return join_path(path, capacity, module, L"asciiwall.scr");
+}
+
+static BOOL open_desktop_key(DWORD access, HKEY *key) {
+    return RegOpenKeyExW(HKEY_CURRENT_USER, DESKTOP_KEY, 0, access, key) == ERROR_SUCCESS;
+}
+
+static BOOL read_screensaver_selection(HKEY desktop, WCHAR *path, size_t capacity,
+                                       RegistryValue *raw_value) {
+    if (!registry_read_value(desktop, L"SCRNSAVE.EXE", raw_value)) return FALSE;
+    path[0] = 0;
+    if (!raw_value->present) return TRUE;
+    if ((raw_value->type != REG_SZ && raw_value->type != REG_EXPAND_SZ) ||
+        !raw_value->size || raw_value->size % sizeof(WCHAR) ||
+        raw_value->size > capacity * sizeof(WCHAR) ||
+        !wmemchr((const WCHAR *)raw_value->data, L'\0',
+                 raw_value->size / sizeof(WCHAR)))
+        return FALSE;
+    memcpy(path, raw_value->data, raw_value->size);
+    path[capacity - 1] = 0;
+    return TRUE;
+}
+
+static BOOL path_equal(const WCHAR *left, const WCHAR *right) {
+    return CompareStringOrdinal(left, -1, right, -1, TRUE) == CSTR_EQUAL;
+}
+
+static void notify_screensaver_change(void) {
+    DWORD_PTR result;
+    /* A hung notification recipient does not invalidate the registry selection. */
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                        (LPARAM)DESKTOP_KEY, SMTO_ABORTIFHUNG, 1000, &result);
+}
+
+static BOOL screensaver_backup_read(BOOL *valid, RegistryValue *original) {
+    *valid = FALSE;
+    memset(original, 0, sizeof(*original));
+    HKEY key;
+    LSTATUS result = RegOpenKeyExW(HKEY_CURRENT_USER, SAVER_STATE_KEY, 0,
+                                   KEY_QUERY_VALUE, &key);
+    if (result == ERROR_FILE_NOT_FOUND) return TRUE;
+    if (result != ERROR_SUCCESS) return FALSE;
+
+    RegistryValue marker = { 0 };
+    BOOL ok = registry_read_value(key, L"BackupValid", &marker);
+    if (!ok) { RegCloseKey(key); return FALSE; }
+    if (!marker.present) {
+        registry_value_free(&marker);
+        RegCloseKey(key);
+        return TRUE;
+    }
+    if (marker.type != REG_DWORD || marker.size != sizeof(DWORD)) {
+        registry_value_free(&marker);
+        RegCloseKey(key);
+        return FALSE;
+    }
+    DWORD is_valid = *(DWORD *)marker.data;
+    registry_value_free(&marker);
+    if (is_valid == 0) {
+        RegCloseKey(key);
+        return TRUE;
+    }
+    if (is_valid != 1) {
+        RegCloseKey(key);
+        return FALSE;
+    }
+
+    RegistryValue present = { 0 }, type = { 0 };
+    ok = registry_read_value(key, L"OriginalPresent", &present);
+    if (!ok || !present.present || present.type != REG_DWORD ||
+        present.size != sizeof(DWORD)) {
+        registry_value_free(&present);
+        RegCloseKey(key);
+        return FALSE;
+    }
+    DWORD has_original = *(DWORD *)present.data;
+    registry_value_free(&present);
+    if (has_original > 1) {
+        RegCloseKey(key);
+        return FALSE;
+    }
+    if (has_original) {
+        ok = registry_read_value(key, L"OriginalType", &type);
+        if (!ok || !type.present || type.type != REG_DWORD ||
+            type.size != sizeof(DWORD)) {
+            registry_value_free(&type);
+            RegCloseKey(key);
+            return FALSE;
+        }
+        DWORD original_type = *(DWORD *)type.data;
+        registry_value_free(&type);
+        if (original_type != REG_SZ && original_type != REG_EXPAND_SZ) {
+            RegCloseKey(key);
+            return FALSE;
+        }
+        RegistryValue data = { 0 };
+        ok = registry_read_value(key, L"OriginalData", &data);
+        if (!ok || !data.present || data.type != REG_BINARY ||
+            !data.size || data.size % sizeof(WCHAR) ||
+            !wmemchr((const WCHAR *)data.data, L'\0', data.size / sizeof(WCHAR))) {
+            registry_value_free(&data);
+            registry_value_free(original);
+            RegCloseKey(key);
+            return FALSE;
+        }
+        data.type = original_type;
+        *original = data;
+    }
+    *valid = TRUE;
+    RegCloseKey(key);
+    return TRUE;
+}
+
+static BOOL screensaver_backup_save(const RegistryValue *original) {
+    HKEY key;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, SAVER_STATE_KEY, 0, NULL, 0,
+                        KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS)
+        return FALSE;
+
+    DWORD invalid = 0, present = original->present ? 1 : 0;
+    LSTATUS result = RegSetValueExW(key, L"BackupValid", 0, REG_DWORD,
+                                    (const BYTE *)&invalid, sizeof(invalid));
+    if (result == ERROR_SUCCESS)
+        result = RegSetValueExW(key, L"OriginalPresent", 0, REG_DWORD,
+                                (const BYTE *)&present, sizeof(present));
+    if (result == ERROR_SUCCESS && original->present)
+        result = RegSetValueExW(key, L"OriginalType", 0, REG_DWORD,
+                                (const BYTE *)&original->type, sizeof(original->type));
+    if (result == ERROR_SUCCESS && original->present)
+        result = RegSetValueExW(key, L"OriginalData", 0, REG_BINARY,
+                                original->data, original->size);
+    DWORD valid = 1;
+    if (result == ERROR_SUCCESS)
+        result = RegSetValueExW(key, L"BackupValid", 0, REG_DWORD,
+                                (const BYTE *)&valid, sizeof(valid));
+    RegCloseKey(key);
+    return result == ERROR_SUCCESS;
+}
+
+static BOOL screensaver_backup_clear(void) {
+    HKEY key;
+    LSTATUS result = RegOpenKeyExW(HKEY_CURRENT_USER, SAVER_STATE_KEY, 0,
+                                   KEY_SET_VALUE, &key);
+    if (result == ERROR_FILE_NOT_FOUND) return TRUE;
+    if (result != ERROR_SUCCESS) return FALSE;
+    const WCHAR *names[] = { L"BackupValid", L"OriginalPresent", L"OriginalType", L"OriginalData" };
+    BOOL ok = TRUE;
+    for (int i = 0; i < ARRAYSIZE(names); i++) {
+        result = RegDeleteValueW(key, names[i]);
+        if (result != ERROR_SUCCESS && result != ERROR_FILE_NOT_FOUND) ok = FALSE;
+    }
+    RegCloseKey(key);
+    return ok;
+}
+
+static BOOL screensaver_get(BOOL *on) {
+    WCHAR current[MAX_PATH], target[MAX_PATH];
+    RegistryValue raw = { 0 };
+    HKEY desktop;
+    *on = FALSE;
+    if (!open_desktop_key(KEY_QUERY_VALUE, &desktop)) return FALSE;
+    BOOL ok = read_screensaver_selection(desktop, current, ARRAYSIZE(current), &raw);
+    RegCloseKey(desktop);
+    registry_value_free(&raw);
+    if (!ok || !screensaver_path(target, ARRAYSIZE(target))) return FALSE;
+    *on = current[0] && path_equal(current, target);
+    return TRUE;
+}
+
+static BOOL screensaver_set(BOOL on) {
+    WCHAR current[MAX_PATH], target[MAX_PATH];
+    RegistryValue raw = { 0 }, original = { 0 };
+    HKEY desktop;
+    if (!screensaver_path(target, ARRAYSIZE(target)) ||
+        !open_desktop_key(KEY_QUERY_VALUE | KEY_SET_VALUE, &desktop))
+        return FALSE;
+    if (!read_screensaver_selection(desktop, current, ARRAYSIZE(current), &raw)) {
+        registry_value_free(&raw);
+        RegCloseKey(desktop);
+        return FALSE;
+    }
+
+    BOOL ok = TRUE;
+    if (on) {
+        if (current[0] && path_equal(current, target)) {
+            registry_value_free(&raw);
+            RegCloseKey(desktop);
+            return TRUE;
+        }
+        BOOL backup_valid = FALSE;
+        RegistryValue old_backup = { 0 };
+        if (!screensaver_backup_read(&backup_valid, &old_backup)) ok = FALSE;
+        registry_value_free(&old_backup);
+        if (ok && backup_valid) ok = screensaver_backup_clear();
+        if (ok) ok = screensaver_backup_save(&raw);
+        if (ok) {
+            DWORD size = (DWORD)((wcslen(target) + 1) * sizeof(WCHAR));
+            ok = RegSetValueExW(desktop, L"SCRNSAVE.EXE", 0, REG_SZ,
+                                (const BYTE *)target, size) == ERROR_SUCCESS;
+            if (!ok) screensaver_backup_clear();
+            else notify_screensaver_change();
+        }
+    } else if (current[0] && path_equal(current, target)) {
+        BOOL backup_valid = FALSE;
+        if (!screensaver_backup_read(&backup_valid, &original)) ok = FALSE;
+        if (ok && backup_valid && original.present) {
+            ok = RegSetValueExW(desktop, L"SCRNSAVE.EXE", 0, original.type,
+                                original.data, original.size) == ERROR_SUCCESS;
+        } else if (ok) {
+            LSTATUS result = RegDeleteValueW(desktop, L"SCRNSAVE.EXE");
+            ok = result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND;
+        }
+        if (ok) {
+            notify_screensaver_change();
+            ok = screensaver_backup_clear();
+        }
+    } else {
+        ok = screensaver_backup_clear();
+    }
+    registry_value_free(&original);
+    registry_value_free(&raw);
+    RegCloseKey(desktop);
+    return ok;
+}
+
+static BOOL screensaver_start_now(void) {
+    WCHAR path[MAX_PATH], directory[MAX_PATH];
+    DWORD length = GetModuleFileNameW(NULL, directory, ARRAYSIZE(directory));
+    if (!length || length >= ARRAYSIZE(directory)) return FALSE;
+    WCHAR *slash = wcsrchr(directory, L'\\');
+    if (!slash) return FALSE;
+    *slash = 0;
+    if (!join_path(path, ARRAYSIZE(path), directory, L"asciiwall.scr"))
+        return FALSE;
+    DWORD attributes = GetFileAttributesW(path);
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY))
+        return FALSE;
+    return (INT_PTR)ShellExecuteW(NULL, L"open", path, L"/s", directory, SW_SHOWNORMAL) > 32;
+}
+
+static BOOL command_has_argument(const WCHAR *expected) {
+    int count = 0;
+    LPWSTR *arguments = CommandLineToArgvW(GetCommandLineW(), &count);
+    if (!arguments) return FALSE;
+    BOOL found = FALSE;
+    for (int i = 1; i < count; i++) {
+        if (lstrcmpiW(arguments[i], expected) == 0) {
+            found = TRUE;
+            break;
+        }
+    }
+    LocalFree(arguments);
+    return found;
+}
+
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cmd, int show) {
-    BOOL open_settings = wcsstr(cmd, L"--settings") != NULL;
-    if (wcsstr(cmd, L"--quit")) { HWND h = FindWindowW(CLS_CTL, NULL); if (h) PostMessageW(h, WM_CLOSE, 0, 0); return 0; }
-    if (wcsstr(cmd, L"--install"))   return autostart_set(TRUE) ? 0 : 1;
-    if (wcsstr(cmd, L"--uninstall")) return autostart_set(FALSE) ? 0 : 1;
+    BOOL open_settings = command_has_argument(L"--settings");
+    BOOL screen_saver = command_has_argument(L"/s") || command_has_argument(L"--screensaver");
+    if (command_has_argument(L"--quit")) { HWND h = FindWindowW(CLS_CTL, NULL); if (h) PostMessageW(h, WM_CLOSE, 0, 0); return 0; }
+    if (command_has_argument(L"--screensaver-uninstall")) return screensaver_set(FALSE) ? 0 : 1;
+    if (command_has_argument(L"--install"))   return autostart_set(TRUE) ? 0 : 1;
+    if (command_has_argument(L"--uninstall")) return autostart_set(FALSE) ? 0 : 1;
     if (open_settings) {
         HWND existing = FindWindowW(CLS_CTL, NULL);
         if (existing) { PostMessageW(existing, WM_APP_SETTINGS, 0, 0); return 0; }
     }
 
-    CreateMutexW(NULL, FALSE, L"Local\\AsciiWall");
+    CreateMutexW(NULL, FALSE, screen_saver ? L"Local\\AsciiWall.ScreenSaver" : L"Local\\AsciiWall");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;            /* один екземпляр */
 
     SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
@@ -647,16 +1003,21 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cmd, int show) {
     WNDCLASSW wc = { 0 };
     wc.hInstance = hi;
     wc.lpfnWndProc = ctl_proc;  wc.lpszClassName = CLS_CTL;  RegisterClassW(&wc);
+    if (screen_saver) {
+        wc.lpszClassName = CLS_SAVER_CTL;
+        RegisterClassW(&wc);
+    }
     wc.lpfnWndProc = wall_proc; wc.lpszClassName = CLS_WALL; wc.style = CS_OWNDC; RegisterClassW(&wc);
-    if (!settings_ui_init(hi)) {
+    if (!screen_saver && !settings_ui_init(hi)) {
         MessageBoxW(NULL, L"Could not initialize the settings controls.", L"AsciiWall",
                     MB_OK | MB_ICONERROR);
         return 1;
     }
     /* Приховане керуюче вікно: ніколи не показується, тож у панелі задач нічого немає */
-    g.ctl = CreateWindowExW(WS_EX_TOOLWINDOW, CLS_CTL, L"AsciiWall", WS_POPUP, 0, 0, 0, 0, NULL, NULL, hi, NULL);
-    g.msg_taskbar = RegisterWindowMessageW(L"TaskbarCreated");
-    if (!add_tray_icon())
+    g.ctl = CreateWindowExW(WS_EX_TOOLWINDOW, screen_saver ? CLS_SAVER_CTL : CLS_CTL,
+                            L"AsciiWall", WS_POPUP, 0, 0, 0, 0, NULL, NULL, hi, NULL);
+    if (!screen_saver) g.msg_taskbar = RegisterWindowMessageW(L"TaskbarCreated");
+    if (!screen_saver && !add_tray_icon())
         MessageBoxW(NULL, L"Could not create the AsciiWall tray icon. You can still open settings with --settings.",
                     L"AsciiWall", MB_OK | MB_ICONERROR);
 
@@ -665,25 +1026,45 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, PWSTR cmd, int show) {
 
     update_monitor();
     read_ini();
-    if (!attach()) SetTimer(g.ctl, TM_REATTACH, 2000, NULL);
+    if (screen_saver) {
+        g.screen_saver = TRUE;
+        g.enabled = TRUE;
+        g.covered = FALSE;
+        if (!create_screensaver_window()) {
+            MessageBoxW(NULL, L"Could not create the AsciiWall screensaver window.",
+                        L"AsciiWall", MB_OK | MB_ICONERROR);
+            DestroyWindow(g.ctl);
+            return 1;
+        }
+    } else if (!attach()) SetTimer(g.ctl, TM_REATTACH, 2000, NULL);
     load_scene();
+    if (screen_saver) {
+        ShowWindow(g.wall, SW_SHOW);
+        UpdateWindow(g.wall);
+        SetForegroundWindow(g.wall);
+        SetFocus(g.wall);
+        SetCursor(NULL);
+    }
 
-    WTSRegisterSessionNotification(g.ctl, NOTIFY_FOR_THIS_SESSION);
-    RegisterPowerSettingNotification(g.ctl, &kDisplayState, DEVICE_NOTIFY_WINDOW_HANDLE);
-    RegisterPowerSettingNotification(g.ctl, &kAcDc, DEVICE_NOTIFY_WINDOW_HANDLE);
-    static const DWORD ev[][2] = {
-        { EVENT_SYSTEM_FOREGROUND,     EVENT_SYSTEM_FOREGROUND },
-        { EVENT_SYSTEM_MOVESIZEEND,    EVENT_SYSTEM_MOVESIZEEND },
-        { EVENT_SYSTEM_MINIMIZESTART,  EVENT_SYSTEM_MINIMIZEEND },
-        { EVENT_OBJECT_SHOW,           EVENT_OBJECT_HIDE },
-        { EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE },
-        { EVENT_OBJECT_CLOAKED,        EVENT_OBJECT_UNCLOAKED },
-    };
-    for (int i = 0; i < 6; i++)
-        SetWinEventHook(ev[i][0], ev[i][1], NULL, on_win_event, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (!screen_saver) {
+        WTSRegisterSessionNotification(g.ctl, NOTIFY_FOR_THIS_SESSION);
+        RegisterPowerSettingNotification(g.ctl, &kDisplayState, DEVICE_NOTIFY_WINDOW_HANDLE);
+        RegisterPowerSettingNotification(g.ctl, &kAcDc, DEVICE_NOTIFY_WINDOW_HANDLE);
+        static const DWORD ev[][2] = {
+            { EVENT_SYSTEM_FOREGROUND,     EVENT_SYSTEM_FOREGROUND },
+            { EVENT_SYSTEM_MOVESIZEEND,    EVENT_SYSTEM_MOVESIZEEND },
+            { EVENT_SYSTEM_MINIMIZESTART,  EVENT_SYSTEM_MINIMIZEEND },
+            { EVENT_OBJECT_SHOW,           EVENT_OBJECT_HIDE },
+            { EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE },
+            { EVENT_OBJECT_CLOAKED,        EVENT_OBJECT_UNCLOAKED },
+        };
+        for (int i = 0; i < 6; i++)
+            SetWinEventHook(ev[i][0], ev[i][1], NULL, on_win_event, 0, 0,
+                            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    }
     g.dir_watch = FindFirstChangeNotificationW(g.dir, TRUE, FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME);
     g.ini_watch = FindFirstChangeNotificationW(g.config_dir, FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME);
-    g.covered = desktop_covered();
+    if (!screen_saver) g.covered = desktop_covered();
     set_running(TRUE);
     if (open_settings) PostMessageW(g.ctl, WM_APP_SETTINGS, 0, 0);
 
@@ -723,8 +1104,12 @@ done:
     if (g.ini_watch != INVALID_HANDLE_VALUE) FindCloseChangeNotification(g.ini_watch);
     if (g.wall) {                                          /* повернути звичайні шпалери */
         HWND p = GetParent(g.wall);
+        BOOL was_screensaver = g.screen_saver;
+        if (was_screensaver) SetCursor(LoadCursorW(NULL, IDC_ARROW));
+        g.screen_saver = FALSE;
         DestroyWindow(g.wall);
-        RedrawWindow(p, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+        if (!was_screensaver)
+            RedrawWindow(p, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
     }
     if (g.L) lua_close(g.L);
     return 0;

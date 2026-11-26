@@ -1,6 +1,6 @@
 param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '0.1.2'
+    [string]$Version = '0.1.3'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,10 +13,12 @@ $archive = Join-Path $build $archiveName
 
 $requiredFiles = @(
     'asciiwall.exe',
+    'asciiwall.scr',
     'settings.ini',
     'README.txt',
     'THIRD_PARTY_NOTICES.txt'
 )
+$about = Join-Path $root 'ABOUT.md'
 $license = Join-Path $root 'LICENSE'
 
 foreach ($file in $requiredFiles) {
@@ -27,6 +29,9 @@ foreach ($file in $requiredFiles) {
 }
 if (-not (Test-Path -LiteralPath $license -PathType Leaf)) {
     throw "Required project license is missing: $license"
+}
+if (-not (Test-Path -LiteralPath $about -PathType Leaf)) {
+    throw "Required project About file is missing: $about"
 }
 
 $scene = Join-Path $dist 'scenes\campfire.lua'
@@ -43,6 +48,7 @@ foreach ($file in $requiredFiles) {
     Copy-Item -LiteralPath (Join-Path $dist $file) -Destination $stage
 }
 Copy-Item -LiteralPath $license -Destination $stage
+Copy-Item -LiteralPath $about -Destination $stage
 Copy-Item -LiteralPath $scene -Destination (Join-Path $stage 'scenes')
 
 $shell = New-Object -ComObject WScript.Shell
@@ -76,6 +82,12 @@ try {
         $zip,
         (Join-Path $stage 'LICENSE'),
         'LICENSE',
+        [System.IO.Compression.CompressionLevel]::Optimal
+    ) | Out-Null
+    [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+        $zip,
+        (Join-Path $stage 'ABOUT.md'),
+        'ABOUT.md',
         [System.IO.Compression.CompressionLevel]::Optimal
     ) | Out-Null
     [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(

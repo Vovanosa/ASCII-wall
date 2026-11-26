@@ -1,5 +1,5 @@
 #ifndef AppVersion
-#define AppVersion "0.1.2"
+#define AppVersion "0.1.3"
 #endif
 
 [Setup]
@@ -35,11 +35,13 @@ Name: "desktopsettings"; Description: "Create an AsciiWall Settings shortcut on 
 
 [Files]
 Source: "..\dist\asciiwall.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\asciiwall.scr"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\settings.ini"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\scenes\campfire.lua"; DestDir: "{app}\scenes"; Flags: ignoreversion
 Source: "..\dist\README.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\THIRD_PARTY_NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\ABOUT.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\AsciiWall"; Filename: "{app}\asciiwall.exe"; WorkingDir: "{app}"
@@ -52,6 +54,7 @@ Filename: "{app}\asciiwall.exe"; Parameters: "--uninstall"; Flags: runhidden wai
 Filename: "{app}\asciiwall.exe"; Description: "Launch AsciiWall now"; Flags: postinstall nowait skipifsilent
 
 [UninstallRun]
+Filename: "{app}\asciiwall.exe"; Parameters: "--screensaver-uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "RestoreAsciiWallScreenSaver"
 Filename: "{app}\asciiwall.exe"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "StopAsciiWall"
 Filename: "{app}\asciiwall.exe"; Parameters: "--uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveAsciiWallStartup"
 
