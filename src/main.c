@@ -16,8 +16,10 @@
 #include <shlobj.h>
 #include <math.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <wchar.h>
+#include <limits.h>
 #include "lua.h"
 #include "lauxlib.h"
 #include "lualib.h"
@@ -150,6 +152,11 @@ static char *read_file(const WCHAR *path, size_t *len) {
 
 static void set_err(const char *m) { lstrcpynA(g.err, m ? m : "unknown error", sizeof g.err); }
 
+static int target_fps(void) {
+    int fps = g.on_battery ? g.fps_battery : g.fps;
+    return fps < 1 ? 1 : (fps > 60 ? 60 : fps);
+}
+
 /* Запуск/пауза. Пауза = таймер скасовано, потік спить у MsgWait без пробуджень. */
 static void set_running(BOOL force) {
     BOOL visible = g.wall && (g.screen_saver || g.enabled);
@@ -168,9 +175,7 @@ static void set_running(BOOL force) {
         reset_mouse_input();
         return;
     }
-    int fps = g.on_battery ? g.fps_battery : g.fps;
-    if (fps < 1) fps = 1;
-    if (fps > 60) fps = 60;
+    int fps = target_fps();
     LARGE_INTEGER due = { .QuadPart = -10000 };             /* перший кадр через 1 мс */
     SetWaitableTimerEx(g.frame_timer, &due, 1000 / fps, NULL, NULL, NULL, 10); /* 10 мс допуску: Windows може об'єднувати пробудження */
     QueryPerformanceCounter(&g.tprev);
@@ -227,32 +232,96 @@ static void update_monitor(void) {
 }
 
 /* Створює шрифт і (пере)розподіляє сітку під розмір монітора */
-static void apply_font(void) {
+static BOOL apply_font(void) {
     HFONT f = CreateFontW(-MulDiv(g.font_size, GetDpiForSystem(), 96), 0, 0, 0, FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, g.font_name);
-    HDC mdc = CreateCompatibleDC(NULL);
-    HGDIOBJ old = SelectObject(mdc, f);
-    TEXTMETRICW tm; GetTextMetricsW(mdc, &tm);
-    SelectObject(mdc, old); DeleteDC(mdc);
-    if (g.wall) { HDC dc = GetDC(g.wall); SelectObject(dc, f); ReleaseDC(g.wall, dc); } /* CS_OWNDC */
-    if (g.font) DeleteObject(g.font);
-    g.font = f; g.cw = max(1, tm.tmAveCharWidth); g.chh = max(1, tm.tmHeight);
-
-    int cols = (g.mon.right - g.mon.left + g.cw - 1) / g.cw;
-    int rows = (g.mon.bottom - g.mon.top + g.chh - 1) / g.chh;
-    if (cols != g.cols || rows != g.rows) {
-        free(g.back); free(g.front); free(g.run); free(g.dx);
-        g.cols = cols; g.rows = rows;
-        g.back  = malloc(sizeof(Cell) * cols * rows);
-        g.front = calloc((size_t)cols * rows, sizeof(Cell));
-        g.run   = malloc(sizeof(WCHAR) * cols);
-        g.dx    = malloc(sizeof(INT) * cols);
-        for (int i = 0; i < cols * rows; i++) g.back[i] = (Cell){ L' ', g.bg, g.bg };
+    if (!f) {
+        set_err("could not create scene font");
+        return FALSE;
     }
-    for (int i = 0; i < g.cols; i++) g.dx[i] = g.cw;
+    HDC mdc = CreateCompatibleDC(NULL);
+    if (!mdc) {
+        DeleteObject(f);
+        set_err("could not measure scene font");
+        return FALSE;
+    }
+    HGDIOBJ old = SelectObject(mdc, f);
+    if (!old || old == HGDI_ERROR) {
+        DeleteDC(mdc);
+        DeleteObject(f);
+        set_err("could not select scene font for measurement");
+        return FALSE;
+    }
+    TEXTMETRICW tm = { 0 };
+    BOOL measured = GetTextMetricsW(mdc, &tm);
+    SelectObject(mdc, old);
+    DeleteDC(mdc);
+    if (!measured) {
+        DeleteObject(f);
+        set_err("could not measure scene font");
+        return FALSE;
+    }
+
+    int cw = max(1, tm.tmAveCharWidth), chh = max(1, tm.tmHeight);
+    int cols = (g.mon.right - g.mon.left + cw - 1) / cw;
+    int rows = (g.mon.bottom - g.mon.top + chh - 1) / chh;
+    if (cols <= 0 || rows <= 0 || cols > INT_MAX / rows) {
+        DeleteObject(f);
+        set_err("scene grid dimensions are invalid");
+        return FALSE;
+    }
+
+    BOOL resize = cols != g.cols || rows != g.rows;
+    Cell *back = NULL, *front = NULL;
+    WCHAR *run = NULL;
+    INT *dx = NULL;
+    if (resize) {
+        size_t cell_count = (size_t)cols * (size_t)rows;
+        if (cell_count > SIZE_MAX / sizeof(Cell)) {
+            DeleteObject(f);
+            set_err("scene grid is too large");
+            return FALSE;
+        }
+        back = malloc(sizeof(Cell) * cell_count);
+        front = calloc(cell_count, sizeof(Cell));
+        run = malloc(sizeof(WCHAR) * (size_t)cols);
+        dx = malloc(sizeof(INT) * (size_t)cols);
+        if (!back || !front || !run || !dx) {
+            free(back); free(front); free(run); free(dx);
+            DeleteObject(f);
+            set_err("not enough memory for the scene grid");
+            return FALSE;
+        }
+        for (size_t i = 0; i < cell_count; i++)
+            back[i] = (Cell){ L' ', g.bg, g.bg };
+        for (int i = 0; i < cols; i++) dx[i] = cw;
+    }
+
+    HDC wall_dc = g.wall ? GetDC(g.wall) : NULL;
+    HGDIOBJ previous_wall_font = wall_dc ? SelectObject(wall_dc, f) : NULL;
+    if (g.wall && (!wall_dc || !previous_wall_font || previous_wall_font == HGDI_ERROR)) {
+        if (wall_dc) ReleaseDC(g.wall, wall_dc);
+        free(back); free(front); free(run); free(dx);
+        DeleteObject(f);
+        set_err("could not select scene font");
+        return FALSE;
+    }
+    if (wall_dc) ReleaseDC(g.wall, wall_dc);
+
+    if (g.font) DeleteObject(g.font);
+    g.font = f;
+    if (resize) {
+        free(g.back); free(g.front); free(g.run); free(g.dx);
+        g.back = back; g.front = front; g.run = run; g.dx = dx;
+        g.cols = cols; g.rows = rows;
+    } else {
+        for (int i = 0; i < g.cols; i++) g.dx[i] = cw;
+    }
+    g.cw = cw; g.chh = chh;
     g.vis_rows = min(g.rows, (g.work.bottom - g.mon.top) / g.chh);
     g.full_redraw = TRUE;
+    return TRUE;
 }
 
 /* ───────────── Lua API ───────────── */
@@ -352,6 +421,10 @@ static void load_scene(void) {
     if (rc != LUA_OK) { set_err(lua_tostring(L, -1)); lua_close(L); return; }
 
     /* Налаштування сцени: font = { name, size }, background = 0xRRGGBB */
+    WCHAR previous_font_name[ARRAYSIZE(g.font_name)];
+    memcpy(previous_font_name, g.font_name, sizeof previous_font_name);
+    int previous_font_size = g.font_size;
+    COLORREF previous_bg = g.bg;
     wcscpy(g.font_name, L"Consolas"); g.font_size = 16; g.bg = RGB(0, 0, 0);
     if (lua_getglobal(L, "font") == LUA_TTABLE) {
         if (lua_getfield(L, -1, "name") == LUA_TSTRING)
@@ -363,8 +436,36 @@ static void load_scene(void) {
     if (lua_getglobal(L, "background") == LUA_TNUMBER) g.bg = RGBX((unsigned)lua_tointeger(L, -1));
     lua_pop(L, 1);
 
-    apply_font();
-    if (!call_init(L)) { lua_close(L); return; }
+    if (!apply_font()) {
+        char error[sizeof g.err];
+        memcpy(error, g.err, sizeof error);
+        memcpy(g.font_name, previous_font_name, sizeof g.font_name);
+        g.font_size = previous_font_size;
+        g.bg = previous_bg;
+        set_err(error);
+        lua_close(L);
+        return;
+    }
+    if (!call_init(L)) {
+        char error[sizeof g.err];
+        memcpy(error, g.err, sizeof error);
+        lua_close(L);
+        memcpy(g.font_name, previous_font_name, sizeof g.font_name);
+        g.font_size = previous_font_size;
+        g.bg = previous_bg;
+        if (!apply_font()) {
+            g.scene_ok = FALSE;
+            return;
+        }
+        if (g.L && !call_init(g.L)) {
+            g.scene_ok = FALSE;
+            return;
+        }
+        g.scene_ok = g.L != NULL;
+        g.full_redraw = TRUE;
+        set_err(error);
+        return;
+    }
     if (g.L) lua_close(g.L);
     g.L = L; g.scene_ok = TRUE; g.err[0] = 0; g.full_redraw = TRUE;
     if (!g.screen_saver && g.mouse_interactions && !g.mouse_hook)
@@ -578,7 +679,8 @@ static void tick(void) {
     double t  = (double)(now.QuadPart - g.t0.QuadPart) / g.qpf.QuadPart;
     double dt = (double)(now.QuadPart - g.tprev.QuadPart) / g.qpf.QuadPart;
     g.tprev = now;
-    if (dt > 0.1) dt = 0.1;                                  /* без стрибка після паузи */
+    double max_dt = max(0.1, 2.0 / target_fps());
+    if (dt > max_dt) dt = max_dt;                             /* bound catch-up without slowing low-FPS scenes */
     if (g.L && g.scene_ok) {
         lua_getglobal(g.L, "update");
         lua_pushnumber(g.L, t); lua_pushnumber(g.L, dt);
@@ -597,7 +699,7 @@ static void tick(void) {
 static void relayout(void) {          /* зміна роздільності / панелі задач */
     update_monitor();
     if (g.screen_saver) g.work = g.mon;
-    apply_font();
+    BOOL font_ok = apply_font();
     if (g.wall) {
         if (g.screen_saver)
             SetWindowPos(g.wall, HWND_TOPMOST, g.mon.left, g.mon.top,
@@ -606,7 +708,7 @@ static void relayout(void) {          /* зміна роздільності / �
         else
             place_wall(NULL, SWP_NOZORDER);
     }
-    if (g.L && g.scene_ok) g.scene_ok = call_init(g.L);
+    if (font_ok && g.L && g.scene_ok) g.scene_ok = call_init(g.L);
 }
 
 /* ───────────── віконні процедури ───────────── */

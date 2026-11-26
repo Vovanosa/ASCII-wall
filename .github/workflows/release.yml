@@ -16,13 +16,18 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Read version from tag
+      - name: Validate release tag against VERSION
         shell: pwsh
         run: |
-          if ($env:GITHUB_REF_NAME -notmatch '^v(\d+\.\d+\.\d+)$') {
-            throw "Expected a version tag like v0.1.4, got $env:GITHUB_REF_NAME"
+          $version = (Get-Content -LiteralPath 'VERSION' -Raw).Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "VERSION must contain a version in major.minor.patch form. Got: $version"
           }
-          "VERSION=$($Matches[1])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $expectedTag = "v$version"
+          if ($env:GITHUB_REF_NAME -ne $expectedTag) {
+            throw "Release tag $env:GITHUB_REF_NAME does not match VERSION ($expectedTag)."
+          }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Set up GCC and Make
         uses: msys2/setup-msys2@v2
@@ -37,7 +42,7 @@ jobs:
 
       - name: Build ZIP and installer
         shell: msys2 {0}
-        run: make package installer VERSION="$VERSION"
+        run: make package installer
 
       - name: Create or update GitHub release
         shell: pwsh

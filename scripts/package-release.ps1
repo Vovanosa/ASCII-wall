@@ -1,10 +1,20 @@
 param(
-    [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '0.1.4'
+    [string]$Version
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+$versionFile = Join-Path $root 'VERSION'
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
+        throw "Version file is missing: $versionFile"
+    }
+    $Version = (Get-Content -LiteralPath $versionFile -Raw).Trim()
+}
+if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+    throw "Version must have the form major.minor.patch. Got: $Version"
+}
+
 $dist = Join-Path $root 'dist'
 $build = Join-Path $root 'build'
 $stage = Join-Path $build 'package-stage'

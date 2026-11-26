@@ -67,6 +67,7 @@ local baseFlakeCount = 0
 local previousMouseX, previousMouseY
 local fireGust = { x = 0, y = 0, dx = 0, dy = 0, strength = 0 }
 local settings
+local mouseGatherSuppressed = false
 
 local function resetFlake(f, anywhere)
   local l = rand(1, 3)
@@ -189,6 +190,8 @@ end
 function init()
   W, H = COLS, VIS_ROWS
   GY = H - max(4, floor(H * 0.12))
+  local fireSpeed = clamp(cfg("fire_speed", 1), 0, 5) / 4
+  local firePower = clamp(cfg("fire_power", 1), 0, 3)
   settings = {
     starsDensity = clamp(cfg("stars_density", 1), 0, 5),
     starsSpeed = clamp(cfg("stars_speed", 1), 0, 10),
@@ -197,8 +200,9 @@ function init()
     snowSpeed = clamp(cfg("snow_speed", 1), 0, 10),
     snowDrift = clamp(cfg("snow_drift", 1), 0, 5),
     wind = clamp(cfg("wind", 0), -20, 20),
-    firePower = clamp(cfg("fire_power", 1), 0, 3),
-    fireSpeed = clamp(cfg("fire_speed", 1), 0, 5) / 4,
+    firePower = firePower,
+    fireSpeed = fireSpeed,
+    fireEnabled = fireSpeed > 0 and firePower > 0,
     fireWidth = clamp(cfg("fire_width", 1), 0.25, 3),
     mouseFirePower = clamp(cfg("mouse_fire_power", 1), 0, 3),
     mouseSnowRadius = clamp(cfg("mouse_snow_radius", 7), 1, 12),
@@ -298,6 +302,7 @@ function init()
   sparks, coals = {}, {}
   groundTraces = {}
   previousMouseX, previousMouseY = nil, nil
+  mouseGatherSuppressed = false
   fireGust = { x = 0, y = 0, dx = 0, dy = 0, strength = 0 }
   fireClock, glowTimer, coalTimer = 0, 0, 0
 end
@@ -330,7 +335,13 @@ local function tree_at(x, y)
     local top = GY - tree.h - 2
     if x >= tree.x and x < tree.x + tree.width
       and y >= top and y < top + tree.h then
-      return tree, top
+      return tree, top, true
+    end
+    local cx = tree.x + floor(tree.width / 2)
+    local trunkWidth = tree.width >= 9 and 3 or 1
+    if x >= cx - floor(trunkWidth / 2) and x <= cx + floor(trunkWidth / 2)
+      and y >= top + tree.h and y < top + tree.h + 2 then
+      return tree, top, false
     end
   end
 end
@@ -349,10 +360,12 @@ local function shed_tree_snow(tree, top)
 end
 
 local function handle_mouse_press(input)
-  local tree, top = tree_at(input.x, input.y)
-  if tree and tree.snowRows > 0 then
+  local tree, top, canopy = tree_at(input.x, input.y)
+  if not tree then return false end
+  if canopy and tree.snowRows > 0 then
     shed_tree_snow(tree, top)
   end
+  return true
 end
 
 local function update_tree_snow(dt)
@@ -396,6 +409,10 @@ local function update_ground_trace(input, t)
 end
 
 local function update_fire_gust(input, dt)
+  if not settings.fireEnabled then
+    fireGust.strength = 0
+    return
+  end
   fireGust.strength = fireGust.strength * exp(-dt * 0.9)
   local speed = sqrt(input.vx * input.vx + input.vy * input.vy)
   if not input.moved or speed <= 0.1 then return end
@@ -429,9 +446,12 @@ local function update_fire_gust(input, dt)
 end
 
 local function update_mouse_flakes(input, dt, t)
-  if input.pressed then handle_mouse_press(input) end
+  if input.pressed then
+    mouseGatherSuppressed = handle_mouse_press(input)
+  end
+  if not input.down then mouseGatherSuppressed = false end
 
-  local gather = input.inside and input.down
+  local gather = input.inside and input.down and not mouseGatherSuppressed
   local held = 0
   for _, f in ipairs(flakes) do
     if f.held then
@@ -507,10 +527,14 @@ function update(t, dt, input)
   end
   update_mouse_flakes(input, dt, t)
 
-  glowTimer = glowTimer - dt
-  if glowTimer <= 0 then
-    glowTimer = 0.33
-    glow = (0.85 + rand() * 0.3) * settings.glowPower
+  if settings.fireEnabled then
+    glowTimer = glowTimer - dt
+    if glowTimer <= 0 then
+      glowTimer = 0.33
+      glow = (0.85 + rand() * 0.3) * settings.glowPower
+    end
+  else
+    glow = 0
   end
 
   for y = GY, ROWS - 1 do
@@ -531,97 +555,99 @@ function update(t, dt, input)
     end
   end
 
-  -- Crossed support logs and a broad base, with the ground kept on row GY.
-  local logY = GY - 1
-  local cx = FX + floor(FW / 2)
-  local rise = max(2, floor(FH * 0.22))
-  local span = max(3, floor(FW * 0.42))
-  for i = 0, span do
-    local y = logY - floor(i * rise / span)
-    local leftX, rightX = cx - span + i, cx + span - i
-    local bark = i % 4 == 0 and "#" or "="
-    put(leftX, y, i % 4 == 0 and "/" or bark, 0x70401f)
-    put(leftX, y - 1, bark, 0x5c3317)
-    put(rightX, y, i % 4 == 0 and "\\" or bark, 0x70401f)
-    put(rightX, y - 1, bark, 0x5c3317)
-  end
-  local baseLeft, baseRight = cx - span - 1, cx + span + 1
-  for x = baseLeft, baseRight do
-    local i = x - baseLeft
-    put(x, logY, i % 5 == 0 and "#" or "=", i % 5 == 0 and 0x80502d or 0x5c3317)
-    if i % 6 == 2 then put(x, logY - 1, ".", 0x9a5428) end
-  end
+  if settings.fireEnabled then
+    -- Crossed support logs and a broad base, with the ground kept on row GY.
+    local logY = GY - 1
+    local cx = FX + floor(FW / 2)
+    local rise = max(2, floor(FH * 0.22))
+    local span = max(3, floor(FW * 0.42))
+    for i = 0, span do
+      local y = logY - floor(i * rise / span)
+      local leftX, rightX = cx - span + i, cx + span - i
+      local bark = i % 4 == 0 and "#" or "="
+      put(leftX, y, i % 4 == 0 and "/" or bark, 0x70401f)
+      put(leftX, y - 1, bark, 0x5c3317)
+      put(rightX, y, i % 4 == 0 and "\\" or bark, 0x70401f)
+      put(rightX, y - 1, bark, 0x5c3317)
+    end
+    local baseLeft, baseRight = cx - span - 1, cx + span + 1
+    for x = baseLeft, baseRight do
+      local i = x - baseLeft
+      put(x, logY, i % 5 == 0 and "#" or "=", i % 5 == 0 and 0x80502d or 0x5c3317)
+      if i % 6 == 2 then put(x, logY - 1, ".", 0x9a5428) end
+    end
 
-  fireClock = fireClock + dt * settings.fireSpeed
-  while fireClock >= 1 / 30 do
-    stepFire()
-    fireClock = fireClock - 1 / 30
-  end
-  for y = 0, FH - 1 do
-    local windShift = floor(settings.wind * 0.035 * (FH - 1 - y) + 0.5)
-    local vertical = y / max(1, FH - 1)
-    local halfWidth = FW * 0.5 * (0.15 + 0.85 * vertical ^ 0.78)
-    local center = (FW - 1) * 0.5
-    for x = 0, FW - 1 do
-      local screenX, screenY = FX + x, FY + y
-      local dx, dy = (screenX - fireGust.x) / 5, (screenY - fireGust.y) / 3
-      local influence = exp(-(dx * dx + dy * dy)) * fireGust.strength
-      local warp = 4 * influence
-      local sourceX = clamp(x - floor(fireGust.dx * warp + 0.5), 0, FW - 1)
-      local sourceY = clamp(y - floor(fireGust.dy * warp + 0.5), 0, FH - 1)
-      local h = clamp(floor(heat[sourceY * FW + sourceX] or 0) - floor(influence * 10), 0, MAXH)
-      if h > 3 and abs(x - center) <= halfWidth then
-        local ch = fireCh[h] or " "
-        put(FX + x + windShift, FY + y, ch, fireCol[h] or 0xff8420)
+    fireClock = fireClock + dt * settings.fireSpeed
+    while fireClock >= 1 / 30 do
+      stepFire()
+      fireClock = fireClock - 1 / 30
+    end
+    for y = 0, FH - 1 do
+      local windShift = floor(settings.wind * 0.035 * (FH - 1 - y) + 0.5)
+      local vertical = y / max(1, FH - 1)
+      local halfWidth = FW * 0.5 * (0.15 + 0.85 * vertical ^ 0.78)
+      local center = (FW - 1) * 0.5
+      for x = 0, FW - 1 do
+        local screenX, screenY = FX + x, FY + y
+        local dx, dy = (screenX - fireGust.x) / 5, (screenY - fireGust.y) / 3
+        local influence = exp(-(dx * dx + dy * dy)) * fireGust.strength
+        local warp = 4 * influence
+        local sourceX = clamp(x - floor(fireGust.dx * warp + 0.5), 0, FW - 1)
+        local sourceY = clamp(y - floor(fireGust.dy * warp + 0.5), 0, FH - 1)
+        local h = clamp(floor(heat[sourceY * FW + sourceX] or 0) - floor(influence * 10), 0, MAXH)
+        if h > 3 and abs(x - center) <= halfWidth then
+          local ch = fireCh[h] or " "
+          put(FX + x + windShift, FY + y, ch, fireCol[h] or 0xff8420)
+        end
       end
     end
-  end
 
-  if rand() < dt * 5 then
-    sparks[#sparks + 1] = {
-      x = FX + FW / 2 + (rand() - 0.5) * FW * 0.4,
-      y = FY + FH * 0.50,
-      vy = -(4 + rand() * 6),
-      life = 1 + rand() * 1.5,
-      ph = rand() * 6.28
-    }
-  end
-  for i = #sparks, 1, -1 do
-    local s = sparks[i]
-    s.life = s.life - dt
-    if s.life <= 0 then
-      sparks[i] = sparks[#sparks]; sparks[#sparks] = nil
-    else
-      s.x = s.x + (sin(t * 4 + s.ph) * 2 + settings.wind * 0.35) * dt
-      s.y = s.y + s.vy * dt
-      put(s.x, s.y, s.life > 0.8 and "'" or ".", s.life > 0.8 and 0xffc04d or 0xa8481a)
-    end
-  end
-
-  coalTimer = coalTimer - dt
-  if coalTimer <= 0 then
-    coalTimer = 1.2 + rand() * 3.8
-    if rand() < clamp(settings.coalRate, 0, 1) then
-      local side = rand() < 0.5 and -1 or 1
-      coals[#coals + 1] = {
-        x = side < 0 and FX + FW * 0.18 or FX + FW * 0.82,
-        y = FY + FH * (0.55 + rand() * 0.25),
-        vx = side * (1.2 + rand() * 2.2) + settings.wind * 0.25,
-        vy = -(0.3 + rand() * 1.0),
-        life = 1.1 + rand() * 1.2
+    if rand() < dt * 5 then
+      sparks[#sparks + 1] = {
+        x = FX + FW / 2 + (rand() - 0.5) * FW * 0.4,
+        y = FY + FH * 0.50,
+        vy = -(4 + rand() * 6),
+        life = 1 + rand() * 1.5,
+        ph = rand() * 6.28
       }
     end
-  end
-  for i = #coals, 1, -1 do
-    local c = coals[i]
-    c.life = c.life - dt
-    c.vy = c.vy + dt * 3
-    c.x = c.x + c.vx * dt
-    c.y = c.y + c.vy * dt
-    if c.life <= 0 or c.y >= GY - 1 or c.x < 0 or c.x >= W then
-      coals[i] = coals[#coals]; coals[#coals] = nil
-    else
-      put(c.x, c.y, c.life > 0.8 and "*" or ".", c.life > 0.8 and 0xff7335 or 0x5a1d12)
+    for i = #sparks, 1, -1 do
+      local s = sparks[i]
+      s.life = s.life - dt
+      if s.life <= 0 then
+        sparks[i] = sparks[#sparks]; sparks[#sparks] = nil
+      else
+        s.x = s.x + (sin(t * 4 + s.ph) * 2 + settings.wind * 0.35) * dt
+        s.y = s.y + s.vy * dt
+        put(s.x, s.y, s.life > 0.8 and "'" or ".", s.life > 0.8 and 0xffc04d or 0xa8481a)
+      end
+    end
+
+    coalTimer = coalTimer - dt
+    if coalTimer <= 0 then
+      coalTimer = 1.2 + rand() * 3.8
+      if rand() < clamp(settings.coalRate, 0, 1) then
+        local side = rand() < 0.5 and -1 or 1
+        coals[#coals + 1] = {
+          x = side < 0 and FX + FW * 0.18 or FX + FW * 0.82,
+          y = FY + FH * (0.55 + rand() * 0.25),
+          vx = side * (1.2 + rand() * 2.2) + settings.wind * 0.25,
+          vy = -(0.3 + rand() * 1.0),
+          life = 1.1 + rand() * 1.2
+        }
+      end
+    end
+    for i = #coals, 1, -1 do
+      local c = coals[i]
+      c.life = c.life - dt
+      c.vy = c.vy + dt * 3
+      c.x = c.x + c.vx * dt
+      c.y = c.y + c.vy * dt
+      if c.life <= 0 or c.y >= GY - 1 or c.x < 0 or c.x >= W then
+        coals[i] = coals[#coals]; coals[#coals] = nil
+      else
+        put(c.x, c.y, c.life > 0.8 and "*" or ".", c.life > 0.8 and 0xff7335 or 0x5a1d12)
+      end
     end
   end
 end

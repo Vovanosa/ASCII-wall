@@ -1,7 +1,3 @@
-#ifndef AppVersion
-#define AppVersion "0.1.4"
-#endif
-
 [Setup]
 AppId={{20307F45-1493-41B7-93D6-FA3FD75958D3}
 AppName=AsciiWall

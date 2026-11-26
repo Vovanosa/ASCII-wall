@@ -12,7 +12,7 @@ Download either the ZIP or the setup program from [GitHub Releases](https://gith
 
 Open the settings window with the **AsciiWall Settings** shortcut or the tray icon. Settings are organized into **General** (Screen and Screensaver), **Scene** (Weather, Fire, Trees and Lights, Ground and Effects, and Size), and **Interaction** categories. **Scene > Size** selects Small, Medium, or Large and immediately applies that size's scene profile; click **Save** to keep the changes. The size selection is saved and is not changed by the **Defaults** button. Use **Search** to find a setting by name or keyword; results are alphabetized and paged, and selecting one opens its page and focuses the control. The Screen page lets you enable or disable the wallpaper and choose whether it starts with Windows. The Screensaver page lets you optionally use AsciiWall as this account's screensaver or start it immediately; Windows' idle timeout and sign-in options stay unchanged. Because ZIP and setup installs are per-user, this screensaver is selected through AsciiWall Settings rather than appearing as a named entry in Windows' picker. Disabling it restores the prior Windows saver unless you chose another one in Windows in the meantime. Your wallpaper settings are stored in `%APPDATA%\AsciiWall\settings.ini`.
 
-The Interaction page enables mouse effects by default: hold the left mouse button to gather nearby snow, then release to let it fall; clicking snowy trees shakes snow loose. Moving the pointer alone does not attract snow. Tune fire gust power, snow attraction radius and pull, held-flake limit, tree snow showers, and ground-trail lifetime there. Mouse input is observed only while the pointer is over the desktop; it does not capture clicks, so desktop icons and their context menus remain usable. Ground trails can fade after 1-60 seconds or remain until the scene reloads.
+The Interaction page enables mouse effects by default: hold the left mouse button to gather nearby snow, then release to let it fall; clicking snowy trees shakes snow loose without magnetizing snow during that press. Moving the pointer alone does not attract snow. Tune fire gust power, snow attraction radius and pull, held-flake limit, tree snow showers, and ground-trail lifetime there. Mouse input is observed only while the pointer is over the desktop; it does not capture clicks, so desktop icons and their context menus remain usable. Ground trails can fade after 1-60 seconds or remain until the scene reloads. Fire speed is independent of FPS; setting Fire power or Fire speed to 0 hides the campfire, including its logs, embers, and glow.
 
 ## Build from source
 
@@ -20,17 +20,17 @@ Building requires Windows x64 and [w64devkit](https://github.com/skeeto/w64devki
 
 ```text
 make
-make package VERSION=0.1.4
+make package
 ```
 
 To build the Windows installer, also install [Inno Setup 6](https://jrsoftware.org/isinfo.php), then run:
 
 ```text
-make installer VERSION=0.1.4
+make installer
 ```
 
 Release files are created under `build\`. End users do not need w64devkit or Inno Setup.
-The `VERSION` value also determines the version shown in the Settings window.
+The root `VERSION` file is the single source for the version shown in Settings and used in release filenames.
 
 For local development, release testing, and publishing new versions, see [RELEASING.md](RELEASING.md).
 

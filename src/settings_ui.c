@@ -109,7 +109,7 @@ static const WCHAR *s_page_hints[PAGE_COUNT] = {
     L"Choose AsciiWall for this Windows account or start the screensaver now.",
     L"Choosing a size applies its scene profile immediately. Save to keep the changes.",
     L"Adjust stars and snow. Typed values are clamped to their allowed range.",
-    L"Adjust flame and wind. Type values or drag sliders; out-of-range values are clamped.",
+    L"Adjust flame and wind. Fire power or speed 0 hides the whole campfire.",
     L"Set tree spacing, size, and snow coverage. Turn on lights to edit their settings.",
     L"Control embers and snow glow. Type values or drag sliders; values are clamped.",
     L"Hold left mouse to gather snow; click snowy trees to shake them. Tune effects below."

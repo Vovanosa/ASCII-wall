@@ -30,9 +30,12 @@ INTERACTION
 Mouse interaction is enabled by default and does not capture clicks, so desktop icons
 remain usable. Hold the left mouse button to gather nearby snow; releasing it lets the
 snow fall. Moving the pointer alone does not attract snow. Clicking snowy trees shakes
-snow loose. The Interaction page controls fire gust power, snow attraction, the tree snow
-shower, and ground-trail lifetime. Trails fade after 10 seconds by default, can be set up
-to 60 seconds, or can be kept until the scene reloads.
+snow loose without magnetizing snow during that press. The Interaction page controls fire
+gust power, snow attraction, the tree snow shower, and ground-trail lifetime. Trails fade
+after 10 seconds by default, can be set up to 60 seconds, or can be kept until the scene
+reloads.
+Fire speed is independent of FPS; setting Fire power or Fire speed to 0 hides the
+campfire, including its logs, embers, and glow.
 
 EXIT OR REMOVE
 To close AsciiWall, choose Exit AsciiWall from its tray menu.

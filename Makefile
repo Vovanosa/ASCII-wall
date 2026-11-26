@@ -1,6 +1,6 @@
 .RECIPEPREFIX := >
 CC      := gcc
-VERSION ?= 0.1.4
+VERSION ?= $(strip $(file <VERSION))
 CFLAGS  := -O2 -Wall -DNDEBUG -Ilua -DASCIIWALL_VERSION=\"$(VERSION)\"
 LDFLAGS := -s -static -mwindows -municode
 LIBS    := -luser32 -lgdi32 -ladvapi32 -lwtsapi32 -ldwmapi -lshell32 -lcomctl32
@@ -24,7 +24,7 @@ build/app.res.o: src/app.rc src/app.manifest src/asciiwall.ico
 > windres src/app.rc -O coff -o $@
 
 run:
-> -@taskkill /f /im asciiwall.exe >/dev/null 2>&1; sleep 1
+> -@./dist/asciiwall.exe --quit >/dev/null 2>&1; sleep 1
 > $(MAKE) all
 > ./dist/asciiwall.exe &
 
